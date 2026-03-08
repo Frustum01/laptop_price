@@ -1,46 +1,25 @@
 import Dataset from "../models/Dataset.js";
-import { exec } from "child_process";
 import path from "path";
-import fs from "fs";
+import fs from "fs/promises";
 
 export const getVisualization = async (req, res) => {
   try {
-    const dataset = await Dataset.findById(req.params.id);
+    const datasetId = req.params.id;
+    if (!datasetId) return res.status(400).json({ success: false, message: "Dataset ID required" });
 
-    if (!dataset || !dataset.cleanedFilePath) {
+    const userId = req.user?.id || "default_user";
+    const dashboardPath = path.resolve(process.cwd(), `../ml_engine/data/users/${userId}/${datasetId}/dashboard_config.json`);
+    
+    try {
+      const data = await fs.readFile(dashboardPath, "utf-8");
+      return res.json(JSON.parse(data));
+    } catch (e) {
       return res.status(404).json({
         success: false,
-        message: "Visualization data not available",
+        message: "Dashboard configuration not yet generated or available",
       });
     }
 
-    const scriptPath = path.resolve("../ml-engine/visualize.py");
-
-    exec(
-      `python "${scriptPath}" "${dataset.cleanedFilePath}"`,
-      { cwd: path.resolve("../ml-engine") },
-      (error, stdout, stderr) => {
-        if (error) {
-          console.error("VISUAL ERROR:", error);
-          console.error(stderr);
-          return res.status(500).json({
-            success: false,
-            message: "Visualization generation failed",
-          });
-        }
-
-        const result = JSON.parse(stdout);
-        const visualData = fs.readFileSync(
-          path.resolve("../ml-engine", result.visual_file),
-          "utf-8"
-        );
-
-        return res.json({
-          success: true,
-          data: JSON.parse(visualData),
-        });
-      }
-    );
   } catch (err) {
     console.error("VISUAL CONTROLLER ERROR:", err);
     return res.status(500).json({

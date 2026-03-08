@@ -5,6 +5,8 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { dirname } from "path";
 import { uploadDataset } from "../controllers/uploadController.js";
+import { protect } from "../middleware/authMiddleware.js";
+import { uploadLimiter } from "../middleware/rateLimiter.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -48,18 +50,31 @@ const upload = multer({
     }
   },
   limits: {
-    fileSize: 50 * 1024 * 1024, // 50MB limit
+    fileSize: 100 * 1024 * 1024, // 100MB limit
   },
 });
 
-router.post("/upload", (req, res, next) => {
-  upload.single("file")(req, res, (err) => {
+router.post("/upload", uploadLimiter, (req, res, next) => {
+  req.uploadStartTime = Date.now();
+  req.metrics = [];
+  const startMsg = `[UPLOAD-START] dataset upload initiated`;
+  console.log(startMsg);
+  req.metrics.push(startMsg);
+
+  // Use "dataset" since our React api.js sends "dataset" inside FormData
+  upload.single("dataset")(req, res, (err) => {
+    const saveTime = Date.now() - req.uploadStartTime;
+    const saveMsg = `[FILE-SAVED] file saved in ${saveTime}ms`;
+    console.log(saveMsg);
+    req.metrics.push(saveMsg);
+    req.lastStepTime = Date.now();
+
     if (err) {
       if (err instanceof multer.MulterError) {
         if (err.code === "LIMIT_FILE_SIZE") {
           return res.status(400).json({
             success: false,
-            message: "File too large. Maximum size is 50MB.",
+            message: "File too large. Maximum size is 100MB.",
           });
         }
         return res.status(400).json({

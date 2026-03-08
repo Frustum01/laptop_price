@@ -1,9 +1,9 @@
 import express from "express";
-import { protect } from "../middleware/authMiddleware.js";
 
 import {
   getAllDatasets,
   getDatasetById,
+  getDatasetStatus,
   updateDatasetStatus,
   cleanDataset,
   trainDataset,
@@ -18,28 +18,31 @@ const router = express.Router();
 ===================================================== */
 
 // Get all datasets
-router.get("/datasets", protect, getAllDatasets);
+router.get("/datasets", getAllDatasets);
 
 // Get dataset by ID
-router.get("/datasets/:id", protect, getDatasetById);
+router.get("/datasets/:id", getDatasetById);
+
+// Get dataset status
+router.get("/dataset-status/:id", getDatasetStatus);
 
 // Update dataset status (admin / debug)
-router.patch("/datasets/:id/status", protect, updateDatasetStatus);
+router.patch("/datasets/:id/status", updateDatasetStatus);
 
 /* =====================================================
    ML PIPELINE AUTOMATION (PROTECTED)
 ===================================================== */
 
 // Clean dataset (Python script)
-router.post("/datasets/:id/clean",  cleanDataset);
+router.post("/datasets/:id/clean", cleanDataset);
 
 // Train ML model (Python script)
-router.post("/datasets/:id/train",  trainDataset);
+router.post("/datasets/:id/train", trainDataset);
 
 // Get data analysis report
-router.get("/datasets/:id/analysis", protect, getAnalysis);
+router.get("/datasets/:id/analysis", getAnalysis);
 
 // Get trained model metrics
-router.get("/datasets/:id/metrics", protect, getMetrics);
+router.get("/datasets/:id/metrics", getMetrics);
 
 export default router;

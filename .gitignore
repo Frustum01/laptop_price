@@ -7,10 +7,26 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
-*.local
+# Node
+node_modules/
+dist/
+dist-ssr/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+ml_engine/venv/
+venv/
+.pytest_cache/
+ml_engine/data/
+
+# Application Specific
+backend-node/uploads/
+backend-node/output.txt
+backend-node/upload_result.json
+backend-node/test_upload.cjs
+backend-node/test_e2e.cjs
 
 # Editor directories and files
 .vscode/*

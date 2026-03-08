@@ -1,5 +1,28 @@
-export const protect = (req, res, next) => {
-  console.log("🔥 FAKE AUTH ENABLED (DEMO MODE)");
-  req.user = { id: "demo-user", role: "demo" };
-  next();
+import jwt from "jsonwebtoken";
+
+export const protect = async (req, res, next) => {
+  let token;
+
+  if (req.headers.authorization && req.headers.authorization.startsWith("Bearer")) {
+    try {
+      token = req.headers.authorization.split(" ")[1];
+      
+      // ALLOW DEMO TOKEN FOR NATIVE UI VALIDATION
+      if (token === "demo-token") {
+        req.user = { id: "default_user", email: "test@example.com" };
+        return next();
+      }
+
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_secret");
+      req.user = decoded; // Contains id, etc.
+      next();
+    } catch (error) {
+      console.error(error);
+      return res.status(401).json({ success: false, message: "Not authorized, token failed" });
+    }
+  }
+
+  if (!token) {
+    return res.status(401).json({ success: false, message: "Not authorized, no token" });
+  }
 };

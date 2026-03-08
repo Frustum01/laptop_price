@@ -1,116 +1,51 @@
-import { spawn } from "child_process";
 import path from "path";
+import fs from "fs/promises";
 
 export const analyticsSummary = async (req, res) => {
-  const pythonProcess = spawn("python", [
-    path.resolve("../ml-engine/run_summary.py"),
-    JSON.stringify(req.body),
-  ]);
+  const datasetId = req.query.datasetId || req.body.datasetId;
+  if (!datasetId) return res.status(400).json({ error: "datasetId is required" });
 
-  let stdout = "";
-  let stderr = "";
-
-  pythonProcess.stdout.on("data", (data) => {
-    stdout += data.toString();
-  });
-
-  pythonProcess.stderr.on("data", (data) => {
-    stderr += data.toString();
-  });
-
-  pythonProcess.on("close", (code) => {
-    // ❌ Python error
-    if (code !== 0 || stderr) {
-      console.error("Python error:", stderr);
-      return res.status(500).json({
-        error: "Analytics computation failed",
-        details: stderr,
-      });
-    }
-
-    // ❌ No output
-    if (!stdout.trim()) {
-      return res.status(500).json({
-        error: "No output received from analytics engine",
-      });
-    }
-
+  try {
+    const userId = req.user?.id || "default_user";
+    const insightsPath = path.resolve(process.cwd(), `../ml_engine/data/users/${userId}/${datasetId}/insights.json`);
+    const kpiPath = path.resolve(process.cwd(), `../ml_engine/data/users/${userId}/${datasetId}/kpi_summary.json`);
+    
+    let insights = [];
+    
     try {
-      const result = JSON.parse(stdout);
-
-      const insights = [
-        {
-          key: "trend",
-          title: "Revenue Trend",
-          value: result.trend !== null ? `${result.trend}%` : "N/A",
-
-          description: "Change from previous period",
-        },
-        {
-          key: "worst",
-          title: "Top Loss Year",
-          value: `${result.worst_year}`,
-          description: "Lowest aggregated value",
-        },
-        {
-          key: "total",
-          title: "Total Revenue",
-          value: `$${(result.total / 1000).toFixed(1)}K`,
-          description: "Across all periods",
-        },
-        {
-          key: "average",
-          title: "Average Profit",
-          value: `$${(result.average / 1000).toFixed(2)}K`,
-          description: "Mean across dataset",
-        },
-        {
-          key: "best",
-          title: "Best Year",
-          value: `${result.best_year}`,
-          description: "Highest performing period",
-        },
-        {
-          key: "growth",
-          title: "Growth Rate",
-          value: result.growth !== null ? `${result.growth}%` : "N/A",
-
-          description: "Compound annual growth",
-        },
-      ];
-
-      res.json({ insights });
+      const insightData = await fs.readFile(insightsPath, "utf-8");
+      const parsed = JSON.parse(insightData);
+      insights = parsed.insights || [];
     } catch (err) {
-      console.error("Invalid JSON from Python:", stdout);
-      res.status(500).json({
-        error: "Invalid JSON from analytics engine",
-        raw: stdout,
-      });
+      console.warn("insights.json not found, falling back to kpi_summary.json");
+      const kpiData = await fs.readFile(kpiPath, "utf-8");
+      const kpi = JSON.parse(kpiData);
+      insights = [
+        { key: "total", title: "Total Revenue", value: kpi.kpis?.total_sales !== undefined ? `$${kpi.kpis.total_sales.toLocaleString()}` : "N/A", description: "Across all periods" },
+        { key: "profit", title: "Total Profit", value: kpi.kpis?.total_profit !== undefined ? `$${kpi.kpis.total_profit.toLocaleString()}` : "N/A", description: "Across all periods" },
+        { key: "average", title: "Avg Order Value", value: kpi.kpis?.avg_order_value !== undefined ? `$${kpi.kpis.avg_order_value.toFixed(2)}` : "N/A", description: "Average per transaction" }
+      ];
     }
-  });
-};
-export const analyticsChart = async (req, res) => {
-const python = spawn(
-  "python",
-  [path.resolve("../ml-engine/run_charts.py")],
-  {
-    cwd: path.resolve("../ml-engine"), // ✅ THIS IS THE FIX
+
+    res.json({ success: true, insights });
+  } catch (err) {
+    console.error("Artifact read error:", err);
+    res.status(500).json({ error: "Failed to read analytics summary", details: err.message });
   }
-);
+};
 
-  let stdout = "";
-  let stderr = "";
+export const analyticsChart = async (req, res) => {
+  const { datasetId } = req.body;
+  if (!datasetId) return res.status(400).json({ error: "datasetId is required" });
 
-  python.stdout.on("data", d => stdout += d.toString());
-  python.stderr.on("data", d => stderr += d.toString());
-
-  python.stdin.write(JSON.stringify(req.body));
-  python.stdin.end();
-
-  python.on("close", () => {
-    if (stderr) {
-      return res.status(500).json({ error: stderr });
-    }
-    res.json(JSON.parse(stdout));
-  });
+  try {
+    const userId = req.user?.id || "default_user";
+    const forecastPath = path.resolve(process.cwd(), `../ml_engine/data/users/${userId}/${datasetId}/forecast.json`);
+    
+    const data = await fs.readFile(forecastPath, "utf-8");
+    res.json(JSON.parse(data));
+  } catch (err) {
+    console.error("Artifact read error:", err);
+    res.status(500).json({ error: "Failed to read forecast data", details: err.message });
+  }
 };
