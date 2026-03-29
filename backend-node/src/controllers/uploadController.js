@@ -90,8 +90,13 @@ export const uploadDataset = async (req, res) => {
               const errMsg = mlStderrAccumulator ? mlStderrAccumulator.trim() : `Process exited with code ${code}`;
               const errorLog = `\n[${new Date().toISOString()}] PIPELINE_CRASH | Dataset: ${datasetId} | ExitCode: ${code} | Error: ${errMsg}`;
               try {
+                  await fs.mkdir(path.dirname(logPath), { recursive: true });
                   await fs.appendFile(logPath, errorLog);
-                  
+              } catch (err) {
+                  console.error("Could not write to system.log:", err);
+              }
+              
+              try {
                   // Add fallback crash signal
                   const crashSignalPath = path.resolve(`../ml_engine/data/users/${userId}/${datasetId}/crash.json`);
                   await fs.mkdir(path.dirname(crashSignalPath), { recursive: true });

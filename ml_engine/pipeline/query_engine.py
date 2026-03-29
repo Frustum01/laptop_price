@@ -1,582 +1,653 @@
+"""
+DataChat RAG Engine — v7 (Self-Routing with RBAC & Data Operations)
+===================================================================
+Flow:
+  1. LLM sees the question + dataset schema + role/permissions
+  2. LLM decides: "needs_code" or "needs_explanation"
+  3. If needs_code  → LLM writes Pandas code → Python runs it → exact answer
+  4. If needs_explanation → LLM explains using schema knowledge
+  5. Supports data operations (fill_null, update, delete) from CLI
+
+This handles ANY question correctly while respecting user roles.
+"""
+
+import os, json, re
 import pandas as pd
-import json
-from filelock import FileLock
-import os
-import sys
-import logging
-import datetime
-import re
-from rapidfuzz import process, fuzz
+import numpy as np
+import faiss
+import pdfplumber
+import chardet
+import torch
+from sentence_transformers import SentenceTransformer
 
-try:
-    from pipeline.ollama_client import greeting_response as _ollama_greeting
-except ImportError:
-    try:
-        from ollama_client import greeting_response as _ollama_greeting
-    except ImportError:
-        _ollama_greeting = None
 
-logger = logging.getLogger("system_logger")
+def get_device():
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        vram = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"  🎮 GPU: {name} ({vram:.1f} GB VRAM) → CUDA")
+        return 'cuda'
+    print("  💻 No GPU → CPU")
+    return 'cpu'
 
-# Greeting keywords — handled by Ollama before the dataset query engine
-GREETING_TRIGGERS = {
-    "hello", "hi", "hey", "help", "who are you", "what can you do",
-    "how are you", "good morning", "good afternoon", "good evening"
-}
 
-# Non-data questions that have no meaningful dataset answer
-NON_DATA_QUESTIONS = [
-    "what is the capital", "ceo of", "founder of", "weather"
-]
+class RAGEngine:
 
-def check_guardrails(question):
-    q_lower = str(question).lower()
-    for trigger in NON_DATA_QUESTIONS:
-        if trigger in q_lower:
-            return "This question cannot be answered using the uploaded dataset."
-    return None
+    def __init__(self):
+        self.device = get_device()
+        print("⏳ Loading embedding model…")
+        self.embedder     = SentenceTransformer('all-MiniLM-L6-v2', device=self.device)
+        self.dim          = 384
+        self.index        = None
+        self.chunks       = []
+        self.doc_meta     = {}
+        self._loaded      = False
+        self._df          = None
+        self._df_schema   = ''
+        self._hf_pipeline = None
+        print(f"✅ Ready on {self.device.upper()}.\n")
 
-def detect_intent(question):
-    """
-    Rule-based intent routing mapping questions to templates.
-    Dataset exploration intents are detected first.
-    """
-    q_lower = str(question).lower()
+    # ── Document loading ──────────────────────────────────────
+    def load_document(self, filepath, filename):
+        ext = filename.rsplit('.', 1)[-1].lower()
+        print(f"📂 Loading {filename} …")
+        loaders = {'csv': self._load_csv, 'xlsx': self._load_xlsx,
+                   'pdf': self._load_pdf,  'txt':  self._load_txt,
+                   'json': self._load_json}
+        if ext not in loaders:
+            raise ValueError(f"Unsupported: {ext}")
+        chunks, meta = loaders[ext](filepath, filename)
+        self._build_index(chunks)
+        self.doc_meta = meta
+        self._loaded  = True
+        print(f"✅ Indexed {len(chunks)} chunks.\n")
+        return {**meta, 'chunks': len(chunks), 'status': 'ok'}
 
-    # ── Dataset exploration intents (highest priority, checked first) ──────────
-    if any(p in q_lower for p in [
-        "tell me about", "describe dataset", "dataset summary",
-        "what data is available", "about this dataset", "overview of dataset"
-    ]):
-        return "dataset_summary"
+    def _load_csv(self, path, name):
+        df = pd.read_csv(path)
+        for col in df.columns:
+            if any(x in col.lower() for x in ['date','time','month','year']):
+                try: df[col] = pd.to_datetime(df[col], errors='coerce')
+                except: pass
+        self._df = df
+        self._df_schema = self._build_schema(df, name)
+        meta = {'filename': name, 'type': 'csv', 'rows': len(df),
+                'columns': list(df.columns),
+                'preview': df.head(5).to_dict(orient='records')}
+        return self._df_to_chunks(df, name), meta
 
-    if any(p in q_lower for p in [
-        "list products", "show products", "name of products",
-        "what products", "which products", "all products"
-    ]):
-        return "list_products"
+    def _load_xlsx(self, path, name):
+        df = pd.read_excel(path)
+        self._df = df
+        self._df_schema = self._build_schema(df, name)
+        meta = {'filename': name, 'type': 'xlsx', 'rows': len(df),
+                'columns': list(df.columns),
+                'preview': df.head(5).to_dict(orient='records')}
+        return self._df_to_chunks(df, name), meta
 
-    if any(p in q_lower for p in [
-        "what columns", "dataset columns", "show columns",
-        "list columns", "column names", "available columns"
-    ]):
-        return "show_columns"
+    def _build_schema(self, df, name):
+        lines = [
+            f"DataFrame: df  |  File: {name}  |  {len(df)} rows × {len(df.columns)} columns",
+            "", "Columns:"
+        ]
+        for col in df.columns:
+            dtype  = str(df[col].dtype)
+            sample = df[col].dropna().head(3).tolist()
+            lines.append(f"  '{col}' ({dtype}) — e.g. {', '.join(str(v) for v in sample)}")
+        cat_cols = df.select_dtypes(include='object').columns.tolist()
+        if cat_cols:
+            lines.append("\nUnique values:")
+            for col in cat_cols[:10]:
+                uv = df[col].dropna().unique().tolist()
+                lines.append(f"  '{col}': {[str(v) for v in uv[:20]]}")
+        num_cols = df.select_dtypes(include='number').columns.tolist()
+        if num_cols:
+            lines.append("\nNumeric ranges:")
+            for col in num_cols:
+                lines.append(f"  '{col}': min={df[col].min():,.2f}, max={df[col].max():,.2f}, "
+                             f"mean={df[col].mean():,.2f}, nulls={df[col].isnull().sum()}")
+        return '\n'.join(lines)
 
-    if any(p in q_lower for p in [
-        "dataset overview", "executive summary", "key findings",
-        "main insights", "overview"
-    ]):
-        return "dataset_overview"
+    def _df_to_chunks(self, df, name):
+        chunks = [self._df_schema]
+        num_cols = df.select_dtypes(include='number').columns.tolist()
+        cat_cols = df.select_dtypes(include='object').columns.tolist()
+        if num_cols:
+            chunks.append(f"Stats:\n{df[num_cols].describe().round(2).to_string()}")
+        for col in cat_cols[:8]:
+            chunks.append(f"Value counts '{col}':\n{df[col].value_counts().head(15).to_string()}")
+        for i in range(0, len(df), 30):
+            chunks.append(df.iloc[i:i+30].to_string(index=False))
+        return chunks
 
-    # ── Ranking / Top-N intents ───────────────────────────────────────────────
-    if any(p in q_lower for p in [
-        "top", "best", "highest", "most profitable", "best performing",
-        "leading", "number one", "rank"
-    ]):
-        return "top_performers"
+    def _load_pdf(self, path, name):
+        self._df = None; self._df_schema = ''
+        pages = []
+        with pdfplumber.open(path) as pdf:
+            for i, p in enumerate(pdf.pages):
+                t = p.extract_text() or ''
+                if t.strip(): pages.append(f"[Page {i+1}]\n{t}")
+        full = '\n\n'.join(pages)
+        return self._split_text(full), {'filename': name, 'type': 'pdf',
+                                        'pages': len(pages), 'preview': full[:500]}
 
-    if any(p in q_lower for p in [
-        "bottom", "worst", "lowest", "least", "underperform", "poor"
-    ]):
-        return "bottom_performers"
+    def _load_txt(self, path, name):
+        self._df = None; self._df_schema = ''
+        with open(path, 'rb') as f: raw = f.read()
+        enc = chardet.detect(raw)['encoding'] or 'utf-8'
+        text = raw.decode(enc, errors='replace')
+        return self._split_text(text), {'filename': name, 'type': 'txt',
+                                        'chars': len(text), 'preview': text[:500]}
 
-    # ── Grouping / Segmentation ───────────────────────────────────────────────
-    if any(p in q_lower for p in [
-        "count by", "number of", "how many", "breakdown", "split by", "per category"
-    ]):
-        return "count_by_category"
+    def _load_json(self, path, name):
+        with open(path) as f: data = json.load(f)
+        if isinstance(data, list):
+            try:
+                df = pd.json_normalize(data); self._df = df
+                self._df_schema = self._build_schema(df, name)
+                return self._df_to_chunks(df, name), {
+                    'filename': name, 'type': 'json',
+                    'rows': len(df), 'columns': list(df.columns),
+                    'preview': df.head(5).to_dict(orient='records')}
+            except: pass
+        self._df = None; self._df_schema = ''
+        text = json.dumps(data, indent=2)
+        return self._split_text(text), {'filename': name, 'type': 'json', 'preview': text[:500]}
 
-    if any(p in q_lower for p in [
-        "average by", "avg by", "mean by", "average per", "mean per"
-    ]):
-        return "average_by_category"
+    def _split_text(self, text, chunk_size=400, overlap=60):
+        words = text.split()
+        out = []
+        for i in range(0, len(words), chunk_size - overlap):
+            c = ' '.join(words[i:i+chunk_size])
+            if c.strip(): out.append(c)
+        return out or [text[:chunk_size]]
 
-    # ── Time-based ──────────────────────────────────────────────────────────
-    if any(p in q_lower for p in [
-        "monthly", "by month", "per month", "month over month", "month wise"
-    ]):
-        return "monthly_breakdown"
+    # ── FAISS ─────────────────────────────────────────────
+    def _build_index(self, chunks):
+        self.chunks = chunks
+        emb = self.embedder.encode(chunks, show_progress_bar=False, batch_size=64)
+        emb = np.array(emb, dtype='float32')
+        faiss.normalize_L2(emb)
+        self.index = faiss.IndexFlatIP(self.dim)
+        self.index.add(emb)
 
-    if any(p in q_lower for p in [
-        "daily", "by day", "per day", "day wise"
-    ]):
-        return "daily_breakdown"
+    def _retrieve(self, query, top_k=5):
+        q = np.array(self.embedder.encode([query]), dtype='float32')
+        faiss.normalize_L2(q)
+        scores, idxs = self.index.search(q, top_k)
+        return [(float(s), self.chunks[i]) for s, i in zip(scores[0], idxs[0]) if i >= 0]
 
-    if any(p in q_lower for p in [
-        "date range", "earliest", "latest", "oldest", "newest", "when did", "start date", "end date"
-    ]):
-        return "date_range_info"
+    # ── Safe code execution ─────────────────────────────────────
+    def _execute_code(self, code, df):
+        safe_builtins = {
+            'len': len, 'sum': sum, 'min': min, 'max': max,
+            'round': round, 'abs': abs, 'int': int, 'float': float,
+            'str': str, 'bool': bool, 'list': list, 'dict': dict,
+            'range': range, 'enumerate': enumerate, 'zip': zip,
+            'sorted': sorted, 'print': print, 'isinstance': isinstance,
+            'type': type, 'any': any, 'all': all,
+        }
+        local_vars   = {'df': df, 'pd': pd, 'np': np}
+        exec_globals = {'__builtins__': safe_builtins}
+        try:
+            exec(code, exec_globals, local_vars)
+            result = local_vars.get('result', None)
+            if result is None:
+                lines = [l.strip() for l in code.strip().split('\n') if l.strip()]
+                if lines:
+                    result = eval(lines[-1], exec_globals, local_vars)
+            return result, None
+        except Exception as e:
+            return None, str(e)
 
-    # ── Profit / Financial ───────────────────────────────────────────────────
-    if any(p in q_lower for p in [
-        "profit", "margin", "earnings", "net income"
-    ]):
-        return "profit_analysis"
+    def _result_to_str(self, result):
+        if result is None: return "No result"
+        if isinstance(result, pd.DataFrame):
+            return (result.head(30).to_string() +
+                    (f"\n... ({len(result)} rows total)" if len(result) > 30 else ""))
+        if isinstance(result, pd.Series):
+            return (result.head(30).to_string() +
+                    (f"\n... ({len(result)} items)" if len(result) > 30 else ""))
+        if isinstance(result, (int, np.integer)): return f"{result:,}"
+        if isinstance(result, (float, np.floating)): return f"{result:,.4f}"
+        if isinstance(result, list):
+            return str(result[:50]) + (f"... ({len(result)} total)" if len(result) > 50 else "")
+        return str(result)
 
-    # ── Data quality ─────────────────────────────────────────────────────────
-    if any(p in q_lower for p in [
-        "missing", "null", "empty", "data quality", "incomplete"
-    ]):
-        return "data_quality"
+    # ── MAIN ASK — Self-routing + Role-Aware ───────────────────
+    def ask(self, question, backend='ollama', role='viewer', permissions=None):
+        if permissions is None:
+            permissions = ['read']
 
-    if any(p in q_lower for p in [
-        "distribution", "spread", "outlier", "range of", "min max"
-    ]):
-        return "distribution"
+        if self._df is not None:
+            return self._ask_smart(question, backend, role, permissions)
+        return self._ask_rag(question, backend)
 
-    # ── Analytical intents ─────────────────────────────────────────────────────
-    if "why" in q_lower or "cause" in q_lower or "reason" in q_lower or "drop" in q_lower:
-        return "root_cause"
-    if "predict" in q_lower or "future" in q_lower or "next" in q_lower or "forecast" in q_lower:
-        return "trend_analysis"
-    if "recommend" in q_lower or "increase" in q_lower or "improve" in q_lower or "should i do" in q_lower:
-        return "recommendation"
-    if "affect" in q_lower or "impact" in q_lower or "most important" in q_lower or "drive" in q_lower:
-        return "feature_importance"
-    if "compare" in q_lower or "vs" in q_lower or "versus" in q_lower:
-        return "comparison"
-    if "insight" in q_lower or "summary" in q_lower or "analyze" in q_lower:
-        return "analyst_summary"
-    if "filter" in q_lower or "only" in q_lower or "greater than" in q_lower or "less than" in q_lower or "where" in q_lower or "exclude" in q_lower:
-        return "filtering"
-    if "average" in q_lower or "sum" in q_lower or "total" in q_lower or "minimum" in q_lower or "maximum" in q_lower or "how many" in q_lower:
-        return "aggregation"
+    def _ask_smart(self, question, backend, role, permissions):
+        # Build permission context for the LLM
+        perm_note = f"""
+USER ROLE: {role}
+ALLOWED ACTIONS: {', '.join(permissions)}
+"""
+        if 'delete' not in permissions:
+            perm_note += "IMPORTANT: This user CANNOT delete rows. If asked to delete, politely refuse.\n"
+        if 'update' not in permissions:
+            perm_note += "IMPORTANT: This user CANNOT update values. If asked to update, politely refuse.\n"
+        if 'fill_null' not in permissions:
+            perm_note += "IMPORTANT: This user CANNOT fill null values. If asked, politely refuse.\n"
 
-    # Default
-    return "aggregation"
+        prompt = f"""You are a data analyst assistant. A dataset is loaded as `df`.
+{perm_note}
+SCHEMA:
+{self._df_schema}
 
-def extract_entities(question, df_columns):
-    """
-    NLP Entity Extraction using RapidFuzz to map words in the question to DataFrame columns.
-    """
-    words = str(question).replace("?", "").replace(",", "").split()
-    entities = []
-    
-    for word in words:
-        if len(word) < 3: continue
-        result = process.extractOne(word, df_columns, scorer=fuzz.WRatio)
-        if result:
-            match_col, score, _ = result
-            if score > 80:
-                entities.append(match_col)
-                
-    return list(set(entities))
+STRICT RULES:
+1. Any NUMBER answer → must use CODE. NEVER guess numbers.
+2. DIRECT only for: greetings, column definitions, explanations (no numbers).
+3. If DIRECT would contain a number → use CODE instead.
+4. RESPECT the user's role — refuse operations they don't have permission for.
+5. NEVER CREATE MOCK DATA! You MUST use the pre-loaded `df`. Do NOT write `df = pd.DataFrame(...)`.
+6. If the user asks to modify the data (e.g. fill nulls, replace values), write CODE that mutates `df` directly (e.g. `df['col'].fillna(..., inplace=True)`) and set `result = "Data updated successfully"`.
 
-_ARTIFACT_CACHE = {}
+FORMAT — pick one:
+CODE:
+result = <pandas expression>
+EXPLAIN: <one line>
 
-def execute_query(user_id, dataset_id, question):
-    """
-    Executes the query against the dataset.
-    Order: greeting check → guardrails → intent routing → pandas templates.
-    """
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    dataset_dir = os.path.join(base_dir, "data", "users", str(user_id), str(dataset_id))
-    q_lower = str(question).lower().strip()
+or
 
-    # ── 0. Greeting Detection (Ollama) ────────────────────────────────────────
-    is_greeting = any(trigger in q_lower for trigger in GREETING_TRIGGERS)
-    if is_greeting:
-        static_fallback = (
-            "Hello! I'm your DataInsights.ai assistant. "
-            "Ask me about totals, trends, averages, or insights from your uploaded dataset."
-        )
-        if _ollama_greeting:
-            answer = _ollama_greeting(question) or static_fallback
+DIRECT: <plain English, no numbers>
+
+QUESTION: {question}
+RESPONSE:"""
+
+        raw = self._call_llm(prompt, backend, max_tokens=300)
+        print(f"  🤖 LLM: {raw[:150]}")
+
+        code_str = None
+        hint = ''
+        if 'CODE:' in raw:
+            code_match = re.search(r'CODE:\s*(.*?)(?:EXPLAIN:|$)', raw, re.DOTALL)
+            if code_match: code_str = code_match.group(1)
+            explain_match = re.search(r'EXPLAIN:\s*(.*?)$', raw, re.DOTALL)
+            if explain_match: hint = explain_match.group(1).strip()
+        elif '```python' in raw:
+            # Fallback if the LLM just gave markdown code
+            fallback = re.search(r'```python\s*(.*?)\s*```', raw, re.DOTALL)
+            if fallback:
+                code_str = fallback.group(1)
+                hint_match = re.search(r'```.*\s+(.*)$', raw, re.DOTALL)
+                if hint_match: hint = hint_match.group(1).strip()
+
+        if code_str:
+            code = re.sub(r'```python|```', '', code_str).strip()
+            print(f"  📝 Code: {code}")
+
+            result, error = self._execute_code(code, self._df)
+
+            if error:
+                fix_prompt = f"""Code failed: {error}\nCode: {code}\nSchema:\n{self._df_schema}\nFix it (result = ...):"""
+                fixed = re.sub(r'```python|```|CODE:|EXPLAIN:.*', '',
+                               self._call_llm(fix_prompt, backend, max_tokens=150)).strip()
+                result, error2 = self._execute_code(fixed, self._df)
+                if error2:
+                    return self._ask_rag(question, backend)
+
+            result_str = self._result_to_str(result)
+            print(f"  ✅ Result: {result_str[:80]}")
+
+            if isinstance(result, (pd.DataFrame, pd.Series)):
+                return f"Here are the results ({len(result)} {'row' if len(result)==1 else 'rows'}):\n\n{result_str}"
+
+            if isinstance(result, (int, float, np.integer, np.floating)):
+                ep = f"""User asked: "{question}"\nExact answer: {result_str}\n{f'({hint})' if hint else ''}\nWrite ONE clear sentence with this number."""
+                return self._call_llm(ep, backend, max_tokens=80)
+
+            ep = f"""User asked: "{question}"\nResult:\n{result_str}\n{f'Context: {hint}' if hint else ''}\nGive a concise answer."""
+            return self._call_llm(ep, backend, max_tokens=200)
+
+        if 'DIRECT:' in raw:
+            m = re.search(r'DIRECT:\s*(.*?)$', raw, re.DOTALL)
+            if m: return m.group(1).strip()
+
+        cleaned = re.sub(r'CODE:|DIRECT:|EXPLAIN:|```python|```', '', raw).strip()
+        return cleaned or self._ask_rag(question, backend)
+
+    def _ask_rag(self, question, backend):
+        hits    = self._retrieve(question, top_k=5)
+        context = '\n\n---\n\n'.join(c for _, c in hits)
+        if self._df_schema:
+            context = self._df_schema + '\n\n---\n\n' + context
+        prompt = (f"You are a helpful analyst. Answer using ONLY the context.\n"
+                  f"CONTEXT:\n{context}\n\nQUESTION: {question}\n\nANSWER:")
+        return self._call_llm(prompt, backend, max_tokens=350)
+
+    # ── Data modification methods ──────────────────────────
+    def fill_nulls(self, column: str, method: str = 'mean', value=None) -> dict:
+        """Fill null values in a column."""
+        if self._df is None:
+            raise ValueError("No dataset loaded")
+        if column not in self._df.columns:
+            raise ValueError(f"Column '{column}' not found. Available: {list(self._df.columns)}")
+
+        null_count_before = self._df[column].isnull().sum()
+
+        if method == 'mean':
+            fill_val = self._df[column].mean()
+        elif method == 'median':
+            fill_val = self._df[column].median()
+        elif method == 'mode':
+            fill_val = self._df[column].mode()[0]
+        elif method == 'value' and value is not None:
+            # try to cast value to the column type if possible
+            try:
+                col_type = self._df[column].dtype
+                if pd.api.types.is_numeric_dtype(col_type):
+                    fill_val = float(value) if '.' in str(value) else int(value)
+                else:
+                    fill_val = str(value)
+            except:
+                fill_val = value
         else:
-            answer = static_fallback
+            raise ValueError(f"Unknown method '{method}'. Use: mean, median, mode, value")
+
+        self._df[column].fillna(fill_val, inplace=True)
+        null_count_after = self._df[column].isnull().sum()
+
         return {
-            "intent": "greeting",
-            "question": question,
-            "answer": answer,
-            "confidence": 1.0
+            'column':       column,
+            'method':       method,
+            'fill_value':   str(fill_val),
+            'filled':       int(null_count_before - null_count_after),
+            'remaining_nulls': int(null_count_after),
         }
 
-    # ── 1. Guardrails (non-data questions) ────────────────────────────────────
-    guard = check_guardrails(question)
-    if guard:
-        return {"intent": "rejected", "answer": guard, "confidence": "high"}
-        
-    intent = detect_intent(question)
-    confidence = "high"
-    
-    # Pre-load artifacts (Caching Layer)
-    global _ARTIFACT_CACHE
-    cache_key = f"{user_id}_{dataset_id}"
-    
-    if cache_key not in _ARTIFACT_CACHE:
-        _ARTIFACT_CACHE[cache_key] = {}
-        for f in ["kpi_summary.json", "feature_importance.json", "forecast.json", "schema.json", "metrics.json", "insights.json"]:
-            path = os.path.join(dataset_dir, f)
-            if os.path.exists(path):
-                with open(path, 'r') as fp:
-                    _ARTIFACT_CACHE[cache_key][f] = json.load(fp)
-                    
-    artifacts = _ARTIFACT_CACHE[cache_key]
-    answer = None
-    
-    # ── Fast-Path Artifact Routing ──────────────────────────────────────────
-
-    # ──  Dataset Exploration Intents  ──────────────────────────────────────────
-    if intent == "dataset_summary":
-        meta    = {}
-        meta_p  = os.path.join(dataset_dir, "dataset_metadata.json")
-        schema  = artifacts.get("schema.json", {})
-        kpi     = artifacts.get("kpi_summary.json", {})
-        if os.path.exists(meta_p):
-            with open(meta_p) as fh:
-                meta = json.load(fh)
-
-        rows    = meta.get("total_rows", "unknown")
-        cols    = meta.get("total_columns", "unknown")
-        sales_col = schema.get("sales_column", "")
-        date_col  = schema.get("date_column", "")
-        top_product = None
-        product_col = schema.get("product_column")
-        total_sales = None
+    def update_values(self, column: str, condition: str, new_value) -> dict:
+        """Update values in column where condition is true."""
+        if self._df is None:
+            raise ValueError("No dataset loaded")
+        if column not in self._df.columns:
+            raise ValueError(f"Column '{column}' not found")
 
         try:
-            if "cleaned_data" in artifacts:
-                df_sum = artifacts["cleaned_data"]
-            else:
-                df_sum = pd.read_csv(os.path.join(dataset_dir, "cleaned_data.csv"))
-                artifacts["cleaned_data"] = df_sum
+            mask = self._df.eval(condition)
+        except Exception as e:
+            raise ValueError(f"Invalid condition '{condition}': {e}")
 
-            if sales_col and sales_col in df_sum.columns:
-                total_sales = round(df_sum[sales_col].sum(), 2)
-            if product_col and product_col in df_sum.columns and sales_col in df_sum.columns:
-                top_product = df_sum.groupby(product_col)[sales_col].sum().idxmax()
-        except Exception:
+        rows_affected = int(mask.sum())
+        
+        # Cast new_value if applicable
+        try:
+            col_type = self._df[column].dtype
+            if pd.api.types.is_numeric_dtype(col_type):
+                new_value = float(new_value) if '.' in str(new_value) else int(new_value)
+        except:
             pass
 
-        lines = [f"**Dataset Summary**",
-                 f"- Rows: {rows} | Columns: {cols}"]
-        if date_col:
-            lines.append(f"- Date column: {date_col}")
-        if total_sales is not None:
-            lines.append(f"- Total {sales_col}: {total_sales:,}")
-        if top_product:
-            lines.append(f"- Top product: {top_product}")
-        answer = "\n".join(lines)
+        self._df.loc[mask, column] = new_value
 
-    elif intent == "list_products":
-        schema     = artifacts.get("schema.json", {})
-        product_col = schema.get("product_column")
-        if product_col:
-            try:
-                if "cleaned_data" in artifacts:
-                    df_p = artifacts["cleaned_data"]
-                else:
-                    df_p = pd.read_csv(os.path.join(dataset_dir, "cleaned_data.csv"))
-                    artifacts["cleaned_data"] = df_p
+        return {
+            'column':        column,
+            'condition':     condition,
+            'new_value':     str(new_value),
+            'rows_updated':  rows_affected,
+        }
 
-                if product_col in df_p.columns:
-                    products = sorted(df_p[product_col].dropna().unique().tolist())
-                    answer   = f"**Products in dataset** ({len(products)} unique):\n" + "\n".join(f"- {p}" for p in products[:30])
-                    if len(products) > 30:
-                        answer += f"\n... and {len(products)-30} more."
-                else:
-                    answer = f"Product column '{product_col}' not found in cleaned data."
-            except Exception as e:
-                answer = f"Could not retrieve product list: {e}"
-        else:
-            answer = "No product column was detected in this dataset."
+    def delete_rows(self, condition: str) -> dict:
+        """Delete rows matching condition."""
+        if self._df is None:
+            raise ValueError("No dataset loaded")
 
-    elif intent == "show_columns":
         try:
-            if "cleaned_data" in artifacts:
-                df_c = artifacts["cleaned_data"]
-            else:
-                df_c = pd.read_csv(os.path.join(dataset_dir, "cleaned_data.csv"))
-                artifacts["cleaned_data"] = df_c
-
-            cols_l = df_c.columns.tolist()
-            answer = f"**Dataset columns** ({len(cols_l)} total):\n" + "\n".join(f"- {c}" for c in cols_l)
+            mask = self._df.eval(condition)
         except Exception as e:
-            answer = f"Could not read dataset columns: {e}"
+            raise ValueError(f"Invalid condition '{condition}': {e}")
 
-    elif intent == "dataset_overview":
-        ins = artifacts.get("insights.json", {})
-        if ins:
-            exec_summary = ins.get("executive_summary") or ins.get("summary", "")
-            key_insights = ins.get("insights", [])[:4]
-            answer = f"**Executive Summary**\n{exec_summary}"
-            if key_insights:
-                answer += "\n\n**Key Findings:**\n"
-                answer += "\n".join(f"- [{i.get('severity','').upper()}] {i.get('description','')}" for i in key_insights)
-        else:
-            answer = "No insights report found. The dataset may still be processing."
+        rows_before = len(self._df)
+        self._df    = self._df[~mask].reset_index(drop=True)
+        rows_after  = len(self._df)
 
-    # ── Analytical Artifact Routing ──────────────────────────────────────────
-    elif intent == "root_cause" and "kpi_summary.json" in artifacts:
-        rca = artifacts["kpi_summary.json"].get("root_cause_analysis", {})
-        major_factors = rca.get("major_contributing_factors", [])
-        if major_factors:
-            answer = "Based on Root Cause Analysis:\n" + "\n".join([f"- {m}" for m in major_factors])
+        return {
+            'condition':     condition,
+            'rows_deleted':  rows_before - rows_after,
+            'rows_remaining': rows_after,
+        }
 
-    elif intent == "feature_importance" and "feature_importance.json" in artifacts:
-        fi = artifacts["feature_importance.json"].get("importance", {})
-        top_3 = list(fi.items())[:3]
-        if top_3:
-            answer = f"The factors having the highest impact on {artifacts.get('schema.json', {}).get('target_column', 'the target')} are:\n"
-            answer += "\n".join([f"- {k} (Score: {round(v, 4)})" for k, v in top_3])
-            
-    elif intent == "recommendation" and "kpi_summary.json" in artifacts:
-        recs = artifacts["kpi_summary.json"].get("recommendations", [])
-        if recs:
-            answer = "Based on current data patterns, I recommend:\n" + "\n".join([f"- {r}" for r in recs])
-            
-    elif intent == "trend_analysis" and "forecast.json" in artifacts:
-        fc = artifacts["forecast.json"]
-        if fc.get("forecast"):
-            next_val = fc["forecast"][0]
-            answer = f"The predicted {fc.get('target', 'value')} for the next period is {next_val:.2f}."
-            
-    elif intent == "analyst_summary" and "insights.json" in artifacts:
-        ins = artifacts["insights.json"]
-        answer = ins.get("summary", "Analysis completed.") + "\n\nKey Insights:\n"
-        for i in ins.get("insights", [])[:3]:
-            answer += f"- [{i['severity'].upper()}] {i['description']}\n"
-            
-    # Semantic Metric Fast-Path
-    elif intent == "aggregation" and "metrics.json" in artifacts:
-        metrics = artifacts["metrics.json"]
-        q_lower = str(question).lower()
-        if "profit margin" in q_lower and "profit_margin" in metrics:
-            answer = f"The profit margin is {round(metrics['profit_margin'] * 100, 2)}%."
-        elif "revenue" in q_lower and "total_revenue" in metrics:
-            answer = f"The total revenue is {metrics['total_revenue']}."
-        elif "cost" in q_lower and "total_cost" in metrics:
-            answer = f"The total cost is {metrics['total_cost']}."
-
-    # Deep Pandas Fallback query execution
-    if not answer:
-        try:
-            if "cleaned_data" in artifacts:
-                df = artifacts["cleaned_data"]
-            else:
-                df = pd.read_csv(os.path.join(dataset_dir, "cleaned_data.csv"))
-                artifacts["cleaned_data"] = df
-
-            schema = artifacts.get("schema.json", {})
-            sales_col = schema.get("sales_column", df.columns[-1])
-            date_col = schema.get("date_column")
-            
-            # Extract column entities from the question using NLP String Matching
-            entities = extract_entities(question, df.columns.tolist())
-            target_col = entities[0] if entities else sales_col
-            
-            q_lower = str(question).lower()
-            
-            # Template 1: Basic Aggregation
-            if intent == "aggregation":
-                if "minimum" in q_lower:
-                    answer = f"The minimum value of {target_col} is {df[target_col].min()}."
-                elif "maximum" in q_lower:
-                    answer = f"The maximum value of {target_col} is {df[target_col].max()}."
-                elif "average" in q_lower:
-                    answer = f"The average value of {target_col} is {df[target_col].mean():.2f}."
-                elif "total" in q_lower or "sum" in q_lower:
-                    answer = f"The total sum of {target_col} is {df[target_col].sum():.2f}."
-                    
-            # Template 2: Comparison
-            elif intent == "comparison" and len(entities) >= 1:
-                cat_cols = df.select_dtypes(include=['object']).columns.tolist()
-                cat_col = cat_cols[0] if cat_cols else None
-                if cat_col:
-                    grouped = df.groupby(cat_col)[target_col].sum().sort_values(ascending=False)
-                    if len(grouped) >= 2:
-                        answer = f"Comparing {target_col} by {cat_col}:\n1. {grouped.index[0]}: {grouped.iloc[0]:.2f}\n2. {grouped.index[1]}: {grouped.iloc[1]:.2f}"
-            
-            # Template 3: Filtering
-            elif intent == "filtering" and len(entities) >= 1:
-                cat_cols = df.select_dtypes(include=['object']).columns.tolist()
-                filter_col = cat_cols[0] if cat_cols else entities[0]
-                val_counts = df[filter_col].value_counts()
-                if not val_counts.empty:
-                    top_val = val_counts.index[0]
-                    filtered_df = df[df[filter_col] == top_val]
-                    answer = f"Filtering where {filter_col} = '{top_val}': The total {target_col} is {filtered_df[target_col].sum():.2f} across {len(filtered_df)} records."
-
-            # Template 4: Top Performers
-            elif intent == "top_performers":
-                cat_cols = df.select_dtypes(include=['object']).columns.tolist()
-                cat_col = next((c for c in cat_cols if df[c].nunique() < 50), cat_cols[0] if cat_cols else None)
-                if cat_col:
-                    top5 = df.groupby(cat_col)[target_col].sum().sort_values(ascending=False).head(5)
-                    answer = f"**Top 5 by {target_col}:**\n"
-                    for rank, (name, val) in enumerate(top5.items(), 1):
-                        answer += f"{rank}. {name}: {val:,.2f}\n"
-
-            # Template 5: Bottom Performers
-            elif intent == "bottom_performers":
-                cat_cols = df.select_dtypes(include=['object']).columns.tolist()
-                cat_col = next((c for c in cat_cols if df[c].nunique() < 50), cat_cols[0] if cat_cols else None)
-                if cat_col:
-                    bottom5 = df.groupby(cat_col)[target_col].sum().sort_values(ascending=True).head(5)
-                    answer = f"**Bottom 5 by {target_col}:**\n"
-                    for rank, (name, val) in enumerate(bottom5.items(), 1):
-                        answer += f"{rank}. {name}: {val:,.2f}\n"
-
-            # Template 6: Count By Category
-            elif intent == "count_by_category":
-                cat_cols = df.select_dtypes(include=['object']).columns.tolist()
-                cat_col = next((c for c in cat_cols if df[c].nunique() < 50), cat_cols[0] if cat_cols else None)
-                if cat_col:
-                    counts = df[cat_col].value_counts().head(10)
-                    answer = f"**Record count by {cat_col}:**\n"
-                    for name, cnt in counts.items():
-                        answer += f"- {name}: {cnt:,} records\n"
-
-            # Template 7: Average By Category
-            elif intent == "average_by_category":
-                cat_cols = df.select_dtypes(include=['object']).columns.tolist()
-                cat_col = next((c for c in cat_cols if df[c].nunique() < 50), cat_cols[0] if cat_cols else None)
-                if cat_col:
-                    avgs = df.groupby(cat_col)[target_col].mean().sort_values(ascending=False).head(8)
-                    answer = f"**Average {target_col} by {cat_col}:**\n"
-                    for name, avg in avgs.items():
-                        answer += f"- {name}: {avg:,.2f}\n"
-
-            # Template 8: Monthly Breakdown
-            elif intent == "monthly_breakdown":
-                if date_col and date_col in df.columns:
-                    tmp = df.copy()
-                    tmp[date_col] = pd.to_datetime(tmp[date_col], errors='coerce')
-                    tmp['_month'] = tmp[date_col].dt.to_period('M').astype(str)
-                    monthly = tmp.groupby('_month')[target_col].sum().sort_index().tail(12)
-                    answer = f"**Monthly {target_col} (last 12 months):**\n"
-                    for period, val in monthly.items():
-                        answer += f"- {period}: {val:,.2f}\n"
-                else:
-                    answer = "No date column detected. Cannot compute monthly breakdown."
-
-            # Template 9: Daily Breakdown
-            elif intent == "daily_breakdown":
-                if date_col and date_col in df.columns:
-                    tmp = df.copy()
-                    tmp[date_col] = pd.to_datetime(tmp[date_col], errors='coerce')
-                    tmp['_day'] = tmp[date_col].dt.date.astype(str)
-                    daily = tmp.groupby('_day')[target_col].sum().sort_index().tail(14)
-                    answer = f"**Daily {target_col} (last 14 days):**\n"
-                    for day, val in daily.items():
-                        answer += f"- {day}: {val:,.2f}\n"
-                else:
-                    answer = "No date column detected. Cannot compute daily breakdown."
-
-            # Template 10: Date Range Info
-            elif intent == "date_range_info":
-                if date_col and date_col in df.columns:
-                    dates = pd.to_datetime(df[date_col], errors='coerce').dropna()
-                    if len(dates):
-                        answer = (f"**Date range in dataset:**\n"
-                                  f"- Earliest: {dates.min().date()}\n"
-                                  f"- Latest:   {dates.max().date()}\n"
-                                  f"- Span: {(dates.max() - dates.min()).days} days")
-                    else:
-                        answer = "Could not parse date column."
-                else:
-                    answer = "No date column detected in this dataset."
-
-            # Template 11: Profit Analysis
-            elif intent == "profit_analysis":
-                profit_candidates = [c for c in df.columns if 'profit' in str(c).lower() or 'margin' in str(c).lower()]
-                if profit_candidates:
-                    pc = profit_candidates[0]
-                    total_p = df[pc].sum()
-                    avg_p   = df[pc].mean()
-                    answer  = (f"**Profit Analysis ({pc}):**\n"
-                               f"- Total Profit: {total_p:,.2f}\n"
-                               f"- Average Profit per Row: {avg_p:,.2f}\n"
-                               f"- Max: {df[pc].max():,.2f} | Min: {df[pc].min():,.2f}")
-                elif sales_col in df.columns:
-                    answer = f"No explicit profit column found. Total {sales_col}: {df[sales_col].sum():,.2f}"
-
-            # Template 12: Data Quality
-            elif intent == "data_quality":
-                missing = df.isnull().sum()
-                missing = missing[missing > 0]
-                if missing.empty:
-                    answer = "Great news! This dataset has **no missing values**."
-                else:
-                    answer = f"**Missing values by column:**\n"
-                    for col, cnt in missing.sort_values(ascending=False).head(10).items():
-                        pct = 100 * cnt / len(df)
-                        answer += f"- {col}: {cnt:,} missing ({pct:.1f}%)\n"
-
-            # Template 13: Distribution
-            elif intent == "distribution":
-                if pd.api.types.is_numeric_dtype(df[target_col]):
-                    s = df[target_col].dropna()
-                    answer = (f"**Distribution of {target_col}:**\n"
-                              f"- Min:    {s.min():,.2f}\n"
-                              f"- Max:    {s.max():,.2f}\n"
-                              f"- Mean:   {s.mean():,.2f}\n"
-                              f"- Median: {s.median():,.2f}\n"
-                              f"- Std Dev:{s.std():,.2f}")
-            
-            if not answer:
-                answer = f"I scanned the dataset but could not confidently execute a specific query for this question. Try asking about {target_col} totals or averages."
-                confidence = "low"
-                
-        except Exception as e:
-            logger.error(f"Fallback computation failed: {str(e)}")
-            answer = "Sorry, an error occurred while computing the answer directly from the dataset."
-            confidence = "low"
-
-    # Log query output safely using filelock
-    log_dir = os.path.join(base_dir, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "query_logs.json")
-    
-    log_entry = {
-        "user_id": user_id,
-        "dataset_id": dataset_id,
-        "question": question,
-        "intent": intent,
-        "timestamp": datetime.datetime.now().isoformat(),
-        "answer_preview": str(answer)[:100]
-    }
-    
-    logs = []
-    if os.path.exists(log_path):
-        try:
-            with open(log_path, 'r') as f:
-                logs = json.load(f)
-        except: pass
-    logs.append(log_entry)
-    with FileLock(log_path + ".lock"):
-        with open(log_path, 'w') as f:
-            json.dump(logs, f, indent=4)
+    def add_row(self, row_data: dict) -> dict:
+        """Add a new row to the dataset."""
+        if self._df is None:
+            raise ValueError("No dataset loaded")
         
-    logger.info(f"Query executed. Intent: {intent}")
-    return {
-        "intent": intent, 
-        "question": question, 
-        "answer": answer, 
-        "confidence": confidence
-    }
+        try:
+            new_row_df = pd.DataFrame([row_data])
+            self._df = pd.concat([self._df, new_row_df], ignore_index=True)
+            return {
+                'action': 'add_row',
+                'new_total_rows': len(self._df),
+                'row_added': row_data
+            }
+        except Exception as e:
+            raise ValueError(f"Failed to add row: {e}")
+
+    def add_column(self, col_name: str, default_val) -> dict:
+        """Add a new column with a default value."""
+        if self._df is None:
+            raise ValueError("No dataset loaded")
+        if col_name in self._df.columns:
+            raise ValueError(f"Column '{col_name}' already exists.")
+            
+        try:
+            self._df[col_name] = default_val
+            return {
+                'action': 'add_column',
+                'column': col_name,
+                'default_value': str(default_val),
+                'total_columns': len(self._df.columns)
+            }
+        except Exception as e:
+            raise ValueError(f"Failed to add column: {e}")
+
+    # ── LLM caller ────────────────────────────────────────
+    def _call_llm(self, prompt, backend, max_tokens=350):
+        if backend == 'ollama':      return self._ask_ollama(prompt, max_tokens)
+        if backend == 'huggingface': return self._ask_hf(prompt, max_tokens)
+        raise ValueError(f"Unknown: {backend}")
+
+    def _ask_ollama(self, prompt, max_tokens=350):
+        import requests
+        def get_models():
+            try: return [m['name'] for m in
+                         requests.get('http://localhost:11434/api/tags', timeout=5)
+                         .json().get('models', [])]
+            except: return []
+        available = get_models()
+        preferred = ['codellama:7b','codellama:latest','mistral','mistral:latest',
+                     'llama3.2','llama3.2:latest','gemma2:2b','tinyllama']
+        model = next((p for p in preferred if p in available),
+                     available[0] if available else 'mistral')
+        print(f"  🦙 {model}")
+        try:
+            resp = requests.post('http://localhost:11434/api/generate',
+                json={'model': model, 'prompt': prompt, 'stream': False,
+                      'options': {'temperature': 0.1, 'num_predict': max_tokens, 'num_gpu': 99}},
+                timeout=300)
+            resp.raise_for_status()
+            return resp.json().get('response', '').strip() or "❌ Empty response."
+        except requests.exceptions.ConnectionError:
+            return "❌ Ollama not running. Run: ollama serve"
+        except requests.exceptions.Timeout:
+            return "❌ Timed out. Wait 30s and retry."
+        except Exception as e:
+            return f"❌ Error: {e}"
+
+    def _ask_hf(self, prompt, max_tokens=350):
+        try:
+            if self._hf_pipeline is None:
+                from transformers import pipeline
+                model_id = 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'
+                self._hf_pipeline = pipeline('text-generation', model=model_id,
+                    device_map='auto',
+                    torch_dtype=torch.float16 if self.device=='cuda' else torch.float32,
+                    max_new_tokens=max_tokens, do_sample=False, temperature=None, top_p=None)
+            msgs = [{"role":"system","content":"You are a data analyst."},
+                    {"role":"user","content":prompt}]
+            out  = self._hf_pipeline(msgs)
+            text = out[0]['generated_text']
+            if isinstance(text, list):
+                for m in reversed(text):
+                    if m.get('role') == 'assistant': return m['content'].strip()
+            return str(text).strip()
+        except Exception as e:
+            return f"❌ HuggingFace error: {e}"
+
+    def is_loaded(self): return self._loaded
+
+    def clear(self):
+        self.index=None; self.chunks=[]; self.doc_meta={}
+        self._loaded=False; self._df=None; self._df_schema=''
+
+
+# --- CLI WRAPPER CONSOLIDATION ---
+
+import argparse
+import sys
+import warnings
+
+# Silence ALL output so model-loading / debug prints don't corrupt the JSON response.
+class DummyFile(object):
+    def write(self, x): pass
+    def flush(self): pass
+    def isatty(self): return False
+
+original_stdout = sys.stdout
+original_stderr = sys.stderr
+
+# Redirect immediately at module level, not inside main(), so that imports
+# like sentence_transformers don't print to stdout before we take control.
+sys.stdout = DummyFile()
+sys.stderr = DummyFile()
+warnings.filterwarnings('ignore')
+
+def main():
+    parser = argparse.ArgumentParser(description="DataChat CLI Backend Wrapper")
+    parser.add_argument("--user_id", type=str, default="default_user")
+    parser.add_argument("--dataset_id", type=str, required=True)
+    parser.add_argument("--question", type=str, default="")
+    
+    # RBAC Args
+    parser.add_argument("--action", type=str, default="chat") # chat, fill_null, update, delete
+    parser.add_argument("--role", type=str, default="admin") # Default changed to admin if not provided
+    parser.add_argument("--permissions", type=str, default="read,fill_null,update,delete") 
+    
+    # Data Ops Args
+    parser.add_argument("--column", type=str, default="")
+    parser.add_argument("--method", type=str, default="mean")
+    parser.add_argument("--value", type=str, default="")
+    parser.add_argument("--condition", type=str, default="")
+    parser.add_argument("--new_value", type=str, default="")
+    parser.add_argument("--row_data", type=str, default="", help="JSON string of the row to add")
+
+    args = parser.parse_args()
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.dirname(current_dir)
+    dataset_dir = os.path.join(base_dir, "data", "users", args.user_id, args.dataset_id)
+    csv_path = os.path.join(dataset_dir, "cleaned_data.csv")
+
+    def _json_write(data_dict):
+        # Custom encoder handles numpy int/float which normally crash json.dumps
+        class _NpEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, (np.integer,)): return int(obj)
+                if isinstance(obj, (np.floating,)): return float(obj)
+                if isinstance(obj, np.ndarray):    return obj.tolist()
+                return super().default(obj)
+        sys.__stdout__.buffer.write(json.dumps(data_dict, cls=_NpEncoder).encode('utf-8'))
+        sys.__stdout__.buffer.flush()
+
+    if not os.path.exists(csv_path):
+        err = {
+            "error": f"Dataset not found at {csv_path}", 
+            "answer": "Could not find the dataset to answer your query. Has it finished processing?", 
+            "intent": "error", 
+            "confidence": "0"
+        }
+        _json_write(err)
+        sys.exit(0)
+
+    try:
+        import logging
+        logging.getLogger().setLevel(logging.ERROR)
+
+        engine = RAGEngine()
+        engine.load_document(csv_path, "dataset.csv")
+        
+        permissions = [p.strip() for p in args.permissions.split(',')]
+        
+        res = {"source": "ml_engine"}
+
+        if args.action == "chat":
+            answer = engine.ask(args.question, backend='ollama', role=args.role, permissions=permissions)
+            if engine._df is not None:
+                engine._df.to_csv(csv_path, index=False)
+            res.update({
+                "intent": "semantic-rag",
+                "question": args.question,
+                "answer": answer,
+                "confidence": "high"
+            })
+
+        elif args.action == "fill_null":
+            if "fill_null" not in permissions:
+                raise ValueError(f"Role '{args.role}' does not have fill_null permission")
+            result = engine.fill_nulls(args.column, args.method, args.value if args.value else None)
+            engine._df.to_csv(csv_path, index=False)
+            res.update({"intent": "fill_null", "result": result, "answer": f"Successfully filled nulls in {args.column}"})
+
+        elif args.action == "update":
+            if "update" not in permissions:
+                raise ValueError(f"Role '{args.role}' does not have update permission")
+            result = engine.update_values(args.column, args.condition, args.new_value)
+            engine._df.to_csv(csv_path, index=False)
+            res.update({"intent": "update", "result": result, "answer": f"Successfully updated {args.column}"})
+
+        elif args.action == "delete":
+            if "delete" not in permissions:
+                raise ValueError(f"Role '{args.role}' does not have delete permission")
+            result = engine.delete_rows(args.condition)
+            engine._df.to_csv(csv_path, index=False)
+            res.update({"intent": "delete", "result": result, "answer": "Successfully deleted rows matching condition"})
+
+        elif args.action == "add_row":
+            if "update" not in permissions and "add" not in permissions:
+                raise ValueError(f"Role '{args.role}' does not have add/update permission")
+            row_dict = json.loads(args.row_data) if args.row_data else {}
+            if not row_dict:
+                raise ValueError("No valid JSON row_data provided")
+            result = engine.add_row(row_dict)
+            engine._df.to_csv(csv_path, index=False)
+            res.update({"intent": "add_row", "result": result, "answer": "Successfully added new row"})
+
+        elif args.action == "add_column":
+            if "update" not in permissions and "add" not in permissions:
+                raise ValueError(f"Role '{args.role}' does not have add/update permission")
+            result = engine.add_column(args.column, args.value)
+            engine._df.to_csv(csv_path, index=False)
+            res.update({"intent": "add_column", "result": result, "answer": f"Successfully added new column {args.column}"})
+
+        else:
+            raise ValueError(f"Unknown action: {args.action}")
+
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+
+        _json_write(res)
+        
+    except Exception as e:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        err = {"error": str(e), "answer": f"RAG Engine error: {str(e)}", "intent": "error"}
+        _json_write(err)
 
 if __name__ == "__main__":
-    import argparse
-    import sys
-    parser = argparse.ArgumentParser(description="Run the DataInsights.ai Query Engine")
-    parser.add_argument("--user_id", type=str, default="default_user", help="Organizational User ID")
-    parser.add_argument("--dataset_id", type=str, required=True, help="Dataset ID to query")
-    parser.add_argument("--question", type=str, required=True, help="User question to answer")
-    
-    args = parser.parse_args()
-    
-    try:
-        res = execute_query(args.user_id, args.dataset_id, args.question)
-        output = json.dumps(res)
-        # Force UTF-8 encoding for reliable cross-platform piping
-        sys.stdout.buffer.write(output.encode('utf-8'))
-        sys.stdout.buffer.flush()
-    except Exception as e:
-        sys.stderr.write(str(e))
-        err_res = json.dumps({"error": str(e), "answer": "An error occurred in the query engine.", "intent": "error"})
-        sys.stdout.buffer.write(err_res.encode('utf-8'))
-        sys.stdout.buffer.flush()
-    
-    # Force exit to prevent any subsequent prints from libraries or cleanup
-    os._exit(0)
+    main()

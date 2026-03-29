@@ -72,31 +72,11 @@ def clean_and_sample_dataset(dataset_dir):
     metadata["data_quality_score"] = quality_score
     logger.info(f"[{metadata['dataset_id']}] Calculated Data Quality Score: {quality_score}")
     
-    # 2. Cleanup operations
-    df = df.drop_duplicates()
+    # 2. Cleanup operations (SKIPPED PER USER REQUEST)
+    # The user requested to keep the dataset raw to preserve nulls and duplicates,
+    # specifically bypassing `drop_duplicates`, `dropna`, and mode/median imputations.
+    pass
     
-    # Drop columns with >70% missing
-    # Threshold is number of NON-NA values required to keep the column
-    thresh = len(df) * 0.30  
-    df = df.dropna(axis=1, thresh=thresh)
-    
-    # Drop constant columns
-    df = df.loc[:, df.nunique() > 1]
-    
-    # Impute missing numeric values via median
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    for col in numeric_cols:
-        if df[col].isnull().any():
-            df[col] = df[col].fillna(df[col].median())
-            
-    # Impute missing categorical values via mode
-    categorical_cols = df.select_dtypes(include=['object', 'category']).columns
-    for col in categorical_cols:
-        if df[col].isnull().any():
-            mode_val = df[col].mode()
-            if not mode_val.empty:
-               df[col] = df[col].fillna(mode_val[0])
-               
     # 3. Create Sampled Dataset for Model Training (if > 500k)
     sampling_applied = False
     train_df = df.copy()

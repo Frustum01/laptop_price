@@ -1,12 +1,38 @@
+# ────────────────────────────────────────────────────────
+# DataInsights AI — Unified ML & Chat Engine Requirements
+# ────────────────────────────────────────────────────────
+
+# Core
 pandas>=2.0.0
 numpy>=1.24.0
+scipy
+flask>=3.0
+werkzeug>=3.0
+requests>=2.32
+filelock>=3.13.0
+
+# Document Loaders & Processing
+openpyxl>=3.1
+pdfplumber>=0.11
+chardet>=5.2
+
+# Modeling & Analytics
 scikit-learn>=1.2.0
 xgboost>=2.0.0
 statsmodels>=0.14.0
 prophet>=1.1.5
 rapidfuzz>=3.0.0
 plotly>=5.14.0
-pytest>=7.0.0
 joblib>=1.2.0
-filelock>=3.13.0
-scipy
+
+# NLP, Vector DB, and LLMs
+sentence-transformers>=2.7
+faiss-cpu>=1.8
+transformers>=4.40
+accelerate>=0.30
+
+# PyTorch Instructions
+# For CUDA 12.x run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Testing
+pytest>=7.0.0

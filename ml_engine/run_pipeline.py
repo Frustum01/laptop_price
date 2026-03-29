@@ -98,15 +98,12 @@ def run_pipeline(file_path, user_id="default_user", dataset_id_input=None):
     result_payload["dataset_id"] = dataset_id
 
     # ── Determine pipeline mode ─────────────────────────────────────────────
-    if row_count < SMALL_THRESHOLD:
-        pipeline_mode = "bi_only"
-    elif row_count < MEDIUM_THRESHOLD:
-        pipeline_mode = "lightweight"
-    else:
-        pipeline_mode = "full"
+    # User specifically requested to skip all machine learning/training processes
+    # so we enforce 'bi_only' mode universally to proceed instantly to dashboard.
+    pipeline_mode = "bi_only"
 
     result_payload["pipeline_mode"] = pipeline_mode
-    logger.info(f"[{dataset_id}] Dataset size: {row_count} rows → mode: {pipeline_mode}")
+    logger.info(f"[{dataset_id}] Dataset size: {row_count} rows → mode: forced to {pipeline_mode}")
 
     training_time  = 0
     forecast_time  = 0
@@ -143,20 +140,15 @@ def run_pipeline(file_path, user_id="default_user", dataset_id_input=None):
             result_payload["artifacts_generated"].append("feature_importance.json")
 
         # ── 6. Forecasting (guardrail: only if date + target present) ───────
-        has_datetime = bool(schema.get("date_column"))
-        has_target   = bool(schema.get("sales_column") or schema.get("profit_column"))
-
-        if has_datetime and has_target:
-            fc_res, forecast_time = _timed_stage("forecaster", generate_forecast, dataset_dir)
-        else:
-            logger.info(f"[{dataset_id}] Forecasting skipped — missing datetime or target column.")
-            forecast_path = os.path.join(dataset_dir, "forecast.json")
-            from filelock import FileLock
-            with FileLock(forecast_path + ".lock"):
-                with open(forecast_path, "w") as fh:
-                    json.dump({"status": "skipped", "reason": "missing_datetime_or_target"}, fh, indent=4)
-            fc_res = {"status": "skipped"}
-            forecast_time = 0.0
+        # User requested no AI processes, skipping completely.
+        logger.info(f"[{dataset_id}] Forecasting skipped per user request.")
+        forecast_path = os.path.join(dataset_dir, "forecast.json")
+        from filelock import FileLock
+        with FileLock(forecast_path + ".lock"):
+            with open(forecast_path, "w") as fh:
+                json.dump({"status": "skipped", "reason": "user_forced_skip"}, fh, indent=4)
+        fc_res = {"status": "skipped"}
+        forecast_time = 0.0
 
         result_payload["artifacts_generated"].append("forecast.json")
 
