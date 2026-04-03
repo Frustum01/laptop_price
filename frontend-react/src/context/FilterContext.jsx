@@ -1,49 +1,42 @@
-import { createContext, useContext, useState } from "react";
+import React, { createContext, useContext, useState } from "react";
 
 const FilterContext = createContext();
 
 export const FilterProvider = ({ children }) => {
   const [filters, setFilters] = useState({});
 
-  const updateFilter = (column, value, isRange = false) => {
+  // ✅ TOGGLE FILTER (MULTI SELECT)
+  const setSingleFilter = (key, value) => {
     setFilters((prev) => {
-      let updated = { ...prev };
+      const existing = prev[key] || [];
+      const arr = Array.isArray(existing) ? existing : [existing];
 
-      if (isRange) {
-        updated[column] = value;
-      } else {
-        const current = updated[column] || [];
+      if (arr.includes(value)) {
+        const updated = arr.filter((v) => v !== value);
 
-        if (current.includes(value)) {
-          updated[column] = current.filter((v) => v !== value);
-        } else {
-          updated[column] = [...current, value];
+        if (updated.length === 0) {
+          const newFilters = { ...prev };
+          delete newFilters[key];
+          return newFilters;
         }
-      }
 
-      return updated;
+        return { ...prev, [key]: updated };
+      } else {
+        return { ...prev, [key]: [...arr, value] };
+      }
     });
   };
 
-  const setSingleFilter = (column, value) => {
-    setFilters((prev) => ({
-      ...prev,
-      [column]: [value],
-    }));
-  };
-
-  const clearFilter = (column) => {
+  const clearFilter = (key) => {
     setFilters((prev) => {
-      const updated = { ...prev };
-      delete updated[column];
-      return updated;
+      const newFilters = { ...prev };
+      delete newFilters[key];
+      return newFilters;
     });
   };
 
   return (
-    <FilterContext.Provider
-      value={{ filters, updateFilter, setSingleFilter, clearFilter }}
-    >
+    <FilterContext.Provider value={{ filters, setSingleFilter, clearFilter }}>
       {children}
     </FilterContext.Provider>
   );

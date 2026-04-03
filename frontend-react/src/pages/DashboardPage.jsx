@@ -14,15 +14,12 @@ import { MessageSquare } from "lucide-react";
 
 const COLORS = ["#58a6ff", "#bc8cff", "#3fb950", "#d29922", "#f85149"];
 
-
-// ✅ MAIN CONTENT
+// ================= MAIN CONTENT =================
 const DashboardContent = () => {
   const { datasetId } = useParams();
   const navigate = useNavigate();
 
-  // 🔥 IMPORTANT (cross filter)
   const { filters, setSingleFilter, clearFilter } = useFilter();
-
   const [dashboardData, setDashboardData] = useState(null);
 
   useEffect(() => {
@@ -33,18 +30,24 @@ const DashboardContent = () => {
     fetchData();
   }, [datasetId]);
 
-  // ✅ APPLY FILTER LOGIC
+  // ✅ FINAL SMART FILTER (NO DATA BUG FIXED)
   const applyFilters = (data = []) => {
     return data.filter((item) => {
       return Object.keys(filters).every((key) => {
+
+        // 🔥 IGNORE FILTER IF COLUMN NOT PRESENT
+        if (!(key in item)) return true;
+
         const value = filters[key];
+        if (!value) return true;
 
+        // MULTI SELECT SUPPORT
         if (Array.isArray(value)) {
-          return value.includes(item[key]);
-        }
-
-        if (typeof value === "object") {
-          return item[key] >= value.min && item[key] <= value.max;
+          return value.some(
+            (v) =>
+              String(item[key]).trim().toLowerCase() ===
+              String(v).trim().toLowerCase()
+          );
         }
 
         return true;
@@ -52,11 +55,13 @@ const DashboardContent = () => {
     });
   };
 
-  // ✅ RENDER CHART WITH CROSS FILTER
+  // ================= CHART =================
   const renderChart = (chart) => {
     const data = applyFilters(chart.data || []);
 
-    if (!data.length) return <p>No data</p>;
+    if (!data.length) {
+      return <p style={{ opacity: 0.6 }}>No data</p>;
+    }
 
     return (
       <ResponsiveContainer width="100%" height={300}>
@@ -69,9 +74,9 @@ const DashboardContent = () => {
           <Bar
             dataKey={chart.y}
             onClick={(e) => {
-              const clickedValue = e?.payload?.[chart.x];
-              if (clickedValue !== undefined) {
-                setSingleFilter(chart.x, clickedValue);
+              const val = e?.payload?.[chart.x];
+              if (val !== undefined) {
+                setSingleFilter(chart.x, String(val).trim());
               }
             }}
             onDoubleClick={() => clearFilter(chart.x)}
@@ -80,7 +85,6 @@ const DashboardContent = () => {
               <Cell key={i} fill={COLORS[i % COLORS.length]} />
             ))}
           </Bar>
-
         </BarChart>
       </ResponsiveContainer>
     );
@@ -90,25 +94,13 @@ const DashboardContent = () => {
 
   return (
     <div style={{ display: "flex" }}>
-
-      {/* ✅ SIDEBAR */}
+      {/* SIDEBAR */}
       <SidebarFilter data={dashboardData?.charts?.[0]?.data || []} />
 
-      {/* ✅ MAIN CONTENT */}
+      {/* MAIN */}
       <div style={{ flex: 1, padding: "25px" }}>
-
-        {/* HEADER */}
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            marginBottom: "25px",
-          }}
-        >
-          <div>
-            <h1 style={{ fontSize: "28px" }}>Dashboard</h1>
-            <p style={{ opacity: 0.6 }}>{datasetId}</p>
-          </div>
+        <div style={{ display: "flex", justifyContent: "space-between" }}>
+          <h1>Dashboard</h1>
 
           <button
             onClick={() => navigate(`/chat/${datasetId}`)}
@@ -118,36 +110,30 @@ const DashboardContent = () => {
           </button>
         </div>
 
-        {/* INSIGHTS */}
         <InsightsPanel
           summary={dashboardData.executive_summary}
           insights={dashboardData.insights}
         />
 
-        {/* CHART GRID */}
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(2, 1fr)",
-            gap: "20px",
-            marginTop: "20px",
-          }}
-        >
+        <div style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(2, 1fr)",
+          gap: "20px",
+          marginTop: "20px"
+        }}>
           {dashboardData.charts.map((chart, i) => (
             <div key={i} className="glass-panel" style={{ padding: "15px" }}>
-              <h4 style={{ marginBottom: "10px" }}>{chart.title}</h4>
+              <h4>{chart.title}</h4>
               {renderChart(chart)}
             </div>
           ))}
         </div>
-
       </div>
     </div>
   );
 };
 
-
-// ✅ WRAPPER (IMPORTANT)
+// ================= WRAPPER =================
 const DashboardPage = () => {
   return (
     <FilterProvider>
