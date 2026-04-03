@@ -10,6 +10,12 @@
     "install:all": "npm install && cd backend-node && npm install && cd ../frontend-react && npm install"
   },
   "devDependencies": {
-    "concurrently": "^8.2.2"
+    "autoprefixer": "^10.4.27",
+    "concurrently": "^8.2.2",
+    "postcss": "^8.5.8",
+    "tailwindcss": "^4.2.2"
+  },
+  "dependencies": {
+    "recharts": "^3.8.1"
   }
 }

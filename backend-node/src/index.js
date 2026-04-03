@@ -1,7 +1,6 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-// import mongoose from "mongoose";
 
 import connectDB from "./config/db.js";
 import errorHandler from "./middleware/errorMiddleware.js";
@@ -14,6 +13,9 @@ import datasetRoutes from "./routes/datasetRoutes.js";
 import chatRoutes from "./routes/chatRoutes.js";
 import authRoutes from "./routes/authRoutes.js";
 import dataOperationsRoutes from "./routes/dataOperationsRoutes.js";
+
+// 🔥 IMPORT YOUR NEW ROUTE
+import filterRoutes from "./routes/filterRoutes.js";
 
 dotenv.config();
 connectDB();
@@ -32,6 +34,9 @@ app.use("/api", datasetRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/analytics", analyticsRoutes);
 app.use("/api/data", dataOperationsRoutes);
+
+// 🔥 ADD THIS LINE (VERY IMPORTANT)
+app.use("/api", filterRoutes);
 
 /* ========== HEALTH CHECK ========== */
 app.get("/", (req, res) => {
@@ -57,9 +62,8 @@ app.use(errorHandler);
 /* ========== SERVER ========== */
 const PORT = Number(process.env.PORT) || 5000;
 
-// FORCE BIND FOR NATIVE UI TESTING
 app.listen(PORT, () => {
-    console.log("Server running on port " + PORT);
+  console.log("Server running on port " + PORT);
 });
 
 // PREVENT CLEAN EXIT DURING NATIVE MOCKING
