@@ -88,24 +88,34 @@ class RAGEngine:
     def _build_schema(self, df, name):
         lines = [
             f"DataFrame: df  |  File: {name}  |  {len(df)} rows × {len(df.columns)} columns",
-            "", "Columns:"
+            "", "Columns (name | dtype | nulls | sample values):"
         ]
+        # ── Per-column info including NULL counts for EVERY column ──────────
         for col in df.columns:
-            dtype  = str(df[col].dtype)
-            sample = df[col].dropna().head(3).tolist()
-            lines.append(f"  '{col}' ({dtype}) — e.g. {', '.join(str(v) for v in sample)}")
+            dtype      = str(df[col].dtype)
+            null_count = int(df[col].isnull().sum())
+            sample     = df[col].dropna().head(3).tolist()
+            sample_str = ', '.join(str(v) for v in sample)
+            lines.append(
+                f"  '{col}' | {dtype} | nulls={null_count}/{len(df)} "
+                f"| e.g. {sample_str}"
+            )
+        # ── Unique value distribution for categorical columns ────────────────
         cat_cols = df.select_dtypes(include='object').columns.tolist()
         if cat_cols:
-            lines.append("\nUnique values:")
+            lines.append("\nUnique values (categorical):")
             for col in cat_cols[:10]:
                 uv = df[col].dropna().unique().tolist()
                 lines.append(f"  '{col}': {[str(v) for v in uv[:20]]}")
+        # ── Numeric statistics ───────────────────────────────────────────────
         num_cols = df.select_dtypes(include='number').columns.tolist()
         if num_cols:
-            lines.append("\nNumeric ranges:")
+            lines.append("\nNumeric stats:")
             for col in num_cols:
-                lines.append(f"  '{col}': min={df[col].min():,.2f}, max={df[col].max():,.2f}, "
-                             f"mean={df[col].mean():,.2f}, nulls={df[col].isnull().sum()}")
+                lines.append(
+                    f"  '{col}': min={df[col].min():,.2f}, max={df[col].max():,.2f}, "
+                    f"mean={df[col].mean():,.2f}, nulls={df[col].isnull().sum()}"
+                )
         return '\n'.join(lines)
 
     def _df_to_chunks(self, df, name):
@@ -236,19 +246,51 @@ ALLOWED ACTIONS: {', '.join(permissions)}
         if 'fill_null' not in permissions:
             perm_note += "IMPORTANT: This user CANNOT fill null values. If asked, politely refuse.\n"
 
+        # ── Keyword guard: force CODE path for queries that MUST be computed ───
+        _q_lower = question.lower()
+        _force_code_hint = ''
+        _NULL_KEYWORDS  = ['null', 'missing', 'nan', 'empty', 'blank', 'na ']
+        _COUNT_KEYWORDS = ['how many', 'count', 'total', 'number of', 'sum of',
+                           'average', 'mean', 'median', 'max', 'min', 'percent',
+                           'percentage', 'ratio', 'unique', 'distinct']
+        _VIEW_KEYWORDS  = ['show row', 'show me row', 'display row', 'get row',
+                           'show record', 'show me record', 'view row',
+                           'row number', 'row #', 'row no', 'row at index',
+                           'show entry', 'show me entry']
+        _force_kws = _NULL_KEYWORDS + _COUNT_KEYWORDS + _VIEW_KEYWORDS
+        _MUTATION_KEYWORDS = ['fill', 'replace', 'update', 'delete', 'change', 'set']
+        if any(k in _q_lower for k in _MUTATION_KEYWORDS):
+            _force_code_hint = (
+                "\nFORCED RULE: This is a data mutation request. "
+                "You MUST use the JSON_INTENT format. NEVER use CODE or DIRECT for this question.\n"
+            )
+        elif any(k in _q_lower for k in _force_kws):
+            _force_code_hint = (
+                "\nFORCED RULE: This question requires an EXACT computed answer. "
+                "You MUST use the CODE format. NEVER use DIRECT for this question.\n"
+            )
+
         prompt = f"""You are a data analyst assistant. A dataset is loaded as `df`.
 {perm_note}
 SCHEMA:
 {self._df_schema}
 
 STRICT RULES:
-1. Any NUMBER answer → must use CODE. NEVER guess numbers.
+1. Any NUMBER answer → must use CODE. NEVER guess numbers from the schema.
 2. DIRECT only for: greetings, column definitions, explanations (no numbers).
 3. If DIRECT would contain a number → use CODE instead.
 4. RESPECT the user's role — refuse operations they don't have permission for.
-5. NEVER CREATE MOCK DATA! You MUST use the pre-loaded `df`. Do NOT write `df = pd.DataFrame(...)`.
-6. If the user asks to modify the data (e.g. fill nulls, replace values), write CODE that mutates `df` directly (e.g. `df['col'].fillna(..., inplace=True)`) and set `result = "Data updated successfully"`.
-
+5. NEVER CREATE MOCK DATA! Use the pre-loaded `df`. Do NOT write `df = pd.DataFrame(...)`.
+6. Mutation queries (fill nulls / replace / update / delete rows): DO NOT write code to mutate `df`. Instead, you MUST output EXACTLY this format:
+   JSON_INTENT: {{"operation_type": "update|delete|fill_null", "column": "...", "condition": "...", "new_value": "...", "method": "...", "value": "..."}}
+7. NULL / MISSING / COUNT / ROW-VIEW queries MUST use CODE:
+   - null count  → result = df['Col'].isnull().sum()
+   - all nulls   → result = df.isnull().sum()
+   - show row N  → result = df.iloc[N-1]           # human rows are 1-indexed
+   - row count   → result = len(df)
+   - unique vals → result = df['Col'].nunique()
+   The schema shows null counts as hints only — ALWAYS recompute with code.
+{_force_code_hint}
 FORMAT — pick one:
 CODE:
 result = <pandas expression>
@@ -258,11 +300,23 @@ or
 
 DIRECT: <plain English, no numbers>
 
+or
+
+JSON_INTENT: {{"operation_type": "...", ...}}
+
 QUESTION: {question}
 RESPONSE:"""
 
         raw = self._call_llm(prompt, backend, max_tokens=300)
         print(f"  🤖 LLM: {raw[:150]}")
+
+        if 'JSON_INTENT:' in raw:
+            try:
+                import json
+                intent_json = re.search(r'JSON_INTENT:\s*(\{.*?\})', raw, re.DOTALL).group(1)
+                return {"type": "intent", "data": json.loads(intent_json)}
+            except Exception:
+                pass
 
         code_str = None
         hint = ''
@@ -296,12 +350,28 @@ RESPONSE:"""
             result_str = self._result_to_str(result)
             print(f"  ✅ Result: {result_str[:80]}")
 
-            if isinstance(result, (pd.DataFrame, pd.Series)):
-                return f"Here are the results ({len(result)} {'row' if len(result)==1 else 'rows'}):\n\n{result_str}"
+            # ── DataFrame / Series → show data directly, don't pass to LLM ──
+            if isinstance(result, pd.DataFrame):
+                return (
+                    f"Here are the results ({len(result)} "
+                    f"{'row' if len(result) == 1 else 'rows'}):\n\n{result_str}"
+                )
+            if isinstance(result, pd.Series):
+                # Detect single-row selection (index = column names, has a .name = row index)
+                if result.name is not None or not isinstance(result.index, pd.RangeIndex):
+                    row_label = f"Row {result.name}" if result.name is not None else "Row data"
+                    return f"{row_label}:\n\n{result_str}"
+                # Otherwise it's a column Series (e.g. null counts per column)
+                return f"Results ({len(result)} items):\n\n{result_str}"
 
             if isinstance(result, (int, float, np.integer, np.floating)):
                 ep = f"""User asked: "{question}"\nExact answer: {result_str}\n{f'({hint})' if hint else ''}\nWrite ONE clear sentence with this number."""
-                return self._call_llm(ep, backend, max_tokens=80)
+                llm_answer = self._call_llm(ep, backend, max_tokens=80)
+                # Anti-hallucination guard: verify the LLM used the actual number
+                # Local LLMs sometimes substitute a different number
+                if result_str.replace(',', '') not in llm_answer.replace(',', ''):
+                    return f"The answer is {result_str}."  
+                return llm_answer
 
             ep = f"""User asked: "{question}"\nResult:\n{result_str}\n{f'Context: {hint}' if hint else ''}\nGive a concise answer."""
             return self._call_llm(ep, backend, max_tokens=200)
@@ -310,7 +380,7 @@ RESPONSE:"""
             m = re.search(r'DIRECT:\s*(.*?)$', raw, re.DOTALL)
             if m: return m.group(1).strip()
 
-        cleaned = re.sub(r'CODE:|DIRECT:|EXPLAIN:|```python|```', '', raw).strip()
+        cleaned = re.sub(r'CODE:|DIRECT:|EXPLAIN:|JSON_INTENT:|```python|```', '', raw).strip()
         return cleaned or self._ask_rag(question, backend)
 
     def _ask_rag(self, question, backend):
@@ -341,17 +411,21 @@ RESPONSE:"""
         elif method == 'value' and value is not None:
             # try to cast value to the column type if possible
             try:
+                # Strip surrounding quotes that come from user input like 'M' or "M"
+                clean_value = str(value).strip("'\"")
                 col_type = self._df[column].dtype
                 if pd.api.types.is_numeric_dtype(col_type):
-                    fill_val = float(value) if '.' in str(value) else int(value)
+                    fill_val = float(clean_value) if '.' in clean_value else int(clean_value)
                 else:
-                    fill_val = str(value)
+                    fill_val = clean_value
             except:
-                fill_val = value
+                fill_val = str(value).strip("'\"")
         else:
             raise ValueError(f"Unknown method '{method}'. Use: mean, median, mode, value")
 
-        self._df[column].fillna(fill_val, inplace=True)
+        # Use assignment instead of inplace=True to avoid chained-assignment bugs
+        # (inplace=True on df[col] can silently fail in pandas 2.x with Copy-on-Write)
+        self._df[column] = self._df[column].fillna(fill_val)
         null_count_after = self._df[column].isnull().sum()
 
         return {
@@ -535,7 +609,7 @@ def main():
     parser.add_argument("--question", type=str, default="")
     
     # RBAC Args
-    parser.add_argument("--action", type=str, default="chat") # chat, fill_null, update, delete
+    parser.add_argument("--action", type=str, default="chat") # chat, fill_null, update, delete, preview
     parser.add_argument("--role", type=str, default="admin") # Default changed to admin if not provided
     parser.add_argument("--permissions", type=str, default="read,fill_null,update,delete") 
     
@@ -546,6 +620,7 @@ def main():
     parser.add_argument("--condition", type=str, default="")
     parser.add_argument("--new_value", type=str, default="")
     parser.add_argument("--row_data", type=str, default="", help="JSON string of the row to add")
+    parser.add_argument("--operation_type", type=str, default="", help="update | delete | fill_null — for preview mode")
 
     args = parser.parse_args()
 
@@ -588,14 +663,36 @@ def main():
 
         if args.action == "chat":
             answer = engine.ask(args.question, backend='ollama', role=args.role, permissions=permissions)
-            if engine._df is not None:
-                engine._df.to_csv(csv_path, index=False)
-            res.update({
-                "intent": "semantic-rag",
-                "question": args.question,
-                "answer": answer,
-                "confidence": "high"
-            })
+            
+            if isinstance(answer, dict) and answer.get("type") == "intent":
+                intent_data = answer["data"]
+                op = intent_data.get("operation_type", "")
+                # LLMs often put the fill value in "new_value" instead of "value"
+                raw_value = str(intent_data.get("value", "")).strip("'\"")
+                raw_new_value = str(intent_data.get("new_value", "")).strip("'\"")
+                if op == "fill_null" and not raw_value and raw_new_value:
+                    raw_value = raw_new_value
+                preview_result = {
+                    "operation_type": op,
+                    "column": intent_data.get("column", ""),
+                    "condition": intent_data.get("condition", ""),
+                    "new_value": raw_new_value,
+                    "method": intent_data.get("method", "value"),
+                    "value": raw_value
+                }
+                res.update({
+                    "intent": "requires_confirmation",
+                    "previewData": preview_result,
+                    "answer": "I have set up the requested data modification. Please confirm the details.",
+                    "confidence": "high"
+                })
+            else:
+                res.update({
+                    "intent": "semantic-rag",
+                    "question": args.question,
+                    "answer": str(answer) if answer is not None else "No answer generated.",
+                    "confidence": "high"
+                })
 
         elif args.action == "fill_null":
             if "fill_null" not in permissions:
@@ -635,6 +732,37 @@ def main():
             engine._df.to_csv(csv_path, index=False)
             res.update({"intent": "add_column", "result": result, "answer": f"Successfully added new column {args.column}"})
 
+        elif args.action == "preview":
+            # --- PREVIEW MODE: count affected rows, NO disk write ---
+            op_type = args.operation_type.lower()  # update | delete | fill_null
+            preview_result = {
+                "operation_type": op_type,
+                "column":         args.column,
+                "condition":      args.condition,
+                "new_value":      args.new_value,
+                "method":         args.method,
+                "value":          args.value,
+            }
+            if op_type in ("update", "delete") and args.condition:
+                try:
+                    mask = engine._df.eval(args.condition)
+                    preview_result["preview_count"] = int(mask.sum())
+                    preview_result["total_rows"]    = len(engine._df)
+                except Exception as e:
+                    preview_result["preview_count"] = -1
+                    preview_result["parse_error"]   = str(e)
+            elif op_type == "fill_null" and args.column:
+                if args.column in engine._df.columns:
+                    preview_result["preview_count"] = int(engine._df[args.column].isnull().sum())
+                    preview_result["total_rows"]    = len(engine._df)
+                else:
+                    preview_result["preview_count"] = -1
+                    preview_result["parse_error"]   = f"Column '{args.column}' not found"
+            else:
+                preview_result["preview_count"] = -1
+            res.update({"intent": "preview", "result": preview_result,
+                        "answer": f"Preview: {preview_result.get('preview_count', 0)} rows will be affected"})
+
         else:
             raise ValueError(f"Unknown action: {args.action}")
 
@@ -644,9 +772,11 @@ def main():
         _json_write(res)
         
     except Exception as e:
+        import traceback
         sys.stdout = original_stdout
         sys.stderr = original_stderr
-        err = {"error": str(e), "answer": f"RAG Engine error: {str(e)}", "intent": "error"}
+        tb = traceback.format_exc()
+        err = {"error": str(e), "answer": "RAG Engine error: " + str(e), "intent": "error", "traceback": tb}
         _json_write(err)
 
 if __name__ == "__main__":

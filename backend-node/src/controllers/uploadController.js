@@ -112,6 +112,14 @@ export const uploadDataset = async (req, res) => {
               
               if (code === 0) {
                   try {
+                      // Run summary script
+                      const summaryProc = spawn('python', [
+                          `"${path.resolve(process.cwd(), '../ml_engine/summary.py')}"`,
+                          '--file_path', `"${datasetPath}"`,
+                          '--dataset_id', datasetId
+                      ], { shell: true });
+                      summaryProc.on('exit', () => console.log(`[SUMMARY] generated for ${datasetId}`));
+                      
                       const metaPath = path.resolve(`../ml_engine/data/users/${userId}/${datasetId}/dataset_metadata.json`);
                       const metaRaw = await fs.readFile(metaPath, "utf-8");
                       const metaJson = JSON.parse(metaRaw);

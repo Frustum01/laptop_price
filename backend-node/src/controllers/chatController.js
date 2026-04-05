@@ -64,7 +64,8 @@ export const askQuestion = async (req, res) => {
           source: "ml-engine",
           answer: payload.answer || "I could not find an answer to your question in the dataset.",
           intent: payload.intent,
-          confidence: payload.confidence
+          confidence: payload.confidence,
+          previewData: payload.previewData
         });
       } catch (parseError) {
         console.error("Failed to parse Query Engine output:", stdout);

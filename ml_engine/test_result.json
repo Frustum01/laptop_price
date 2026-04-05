@@ -1,0 +1,29 @@
+STDOUT:
+{"source": "ml_engine", "intent": "fill_null", "result": {"column": "Gender", "method": "value", "fill_value": "M", "filled": 0, "remaining_nulls": 0}, "answer": "Successfully filled nulls in Gender"}
+
+STDERR:
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[1mBertModel LOAD REPORT[0m from: sentence-transformers/all-MiniLM-L6-v2
+Key                     | Status     |  | 
+------------------------+------------+--+-
+embeddings.position_ids | UNEXPECTED |  | 
+
+Notes:
+- UNEXPECTED:	can be ignored when loading from different task/architecture; not ok if you expect identical arch.
+
+
+EXIT CODE: 0
+
+PARSED:
+{
+  "source": "ml_engine",
+  "intent": "fill_null",
+  "result": {
+    "column": "Gender",
+    "method": "value",
+    "fill_value": "M",
+    "filled": 0,
+    "remaining_nulls": 0
+  },
+  "answer": "Successfully filled nulls in Gender"
+}

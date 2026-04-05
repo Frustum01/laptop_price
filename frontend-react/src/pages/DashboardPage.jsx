@@ -1,12 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { getDashboardConfig } from '../services/api';
+import { getDashboardConfig, downloadSummaryReport } from '../services/api';
 import InsightsPanel from '../components/InsightsPanel';
 import { 
   BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, 
   Tooltip, ResponsiveContainer, Cell, PieChart, Pie, Legend, AreaChart, Area 
 } from 'recharts';
-import { MessageSquare, Database } from 'lucide-react';
+import { MessageSquare, Database, Download, Check, AlertCircle } from 'lucide-react';
 
 const COLORS = ['#58a6ff', '#bc8cff', '#3fb950', '#d29922', '#f85149'];
 
@@ -16,6 +16,7 @@ const DashboardPage = () => {
   const [dashboardData, setDashboardData] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState('');
+  const [downloadState, setDownloadState] = useState('idle'); // idle | loading | done | error
 
   useEffect(() => {
     if (!datasetId) return;
@@ -201,6 +202,49 @@ const DashboardPage = () => {
         </div>
         
         <div style={{ display: 'flex', gap: '1rem' }}>
+            <button 
+                id="download-summary-btn"
+                className="btn-primary" 
+                onClick={async () => {
+                  setDownloadState('loading');
+                  try {
+                    await downloadSummaryReport(datasetId);
+                    setDownloadState('done');
+                    setTimeout(() => setDownloadState('idle'), 2500);
+                  } catch (err) {
+                    console.error('Download failed:', err);
+                    setDownloadState('error');
+                    setTimeout(() => setDownloadState('idle'), 3000);
+                  }
+                }}
+                disabled={downloadState === 'loading'}
+                style={{ 
+                  background: downloadState === 'done' 
+                    ? 'rgba(63, 185, 80, 0.15)' 
+                    : downloadState === 'error'
+                    ? 'rgba(248, 81, 73, 0.15)'
+                    : 'rgba(88, 166, 255, 0.1)', 
+                  color: downloadState === 'done'
+                    ? 'var(--success)'
+                    : downloadState === 'error'
+                    ? 'var(--danger)'
+                    : 'var(--primary)', 
+                  border: `1px solid ${downloadState === 'done' ? 'rgba(63,185,80,0.3)' : downloadState === 'error' ? 'rgba(248,81,73,0.3)' : 'rgba(88, 166, 255, 0.2)'}`, 
+                  boxShadow: 'none',
+                  cursor: downloadState === 'loading' ? 'wait' : 'pointer',
+                  transition: 'all 0.3s ease',
+                }}
+            >
+                {downloadState === 'loading' ? (
+                  <><Download size={18} style={{ animation: 'spin 1.5s linear infinite' }} /> Generating…</>
+                ) : downloadState === 'done' ? (
+                  <><Check size={18} /> Downloaded</>
+                ) : downloadState === 'error' ? (
+                  <><AlertCircle size={18} /> Failed</>
+                ) : (
+                  <><Download size={18} /> Download Summary</>
+                )}
+            </button>
             <button 
                 className="btn-primary" 
                 onClick={() => navigate(`/chat/${datasetId}`)}
