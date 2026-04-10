@@ -16,6 +16,25 @@
     "tailwindcss": "^4.2.2"
   },
   "dependencies": {
+    "axios": "^1.15.0",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
     "recharts": "^3.8.1"
-  }
+  },
+  "description": "��#\u0000 \u0000D\u0000a\u0000t\u0000a\u0000I\u0000n\u0000s\u0000i\u0000g\u0000h\u0000t\u0000s\u0000.\u0000a\u0000i\u0000\r\u0000 \u0000#\u0000 \u0000D\u0000a\u0000t\u0000a\u0000I\u0000n\u0000s\u0000i\u0000g\u0000h\u0000t\u0000s\u0000.\u0000a\u0000i\u0000\r\u0000 \u0000",
+  "main": "index.js",
+  "directories": {
+    "test": "test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/avijitmandal2004/laptop_price.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/avijitmandal2004/laptop_price/issues"
+  },
+  "homepage": "https://github.com/avijitmandal2004/laptop_price#readme"
 }

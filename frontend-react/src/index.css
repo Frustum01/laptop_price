@@ -1,33 +1,39 @@
+/* ✅ IMPORT MUST BE FIRST */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+/* Tailwind */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
+/* Root Variables */
 :root {
   --bg-color: #0d1117;
   --panel-bg: rgba(22, 27, 34, 0.7);
   --border-color: rgba(48, 54, 61, 0.8);
   --text-main: #c9d1d9;
   --text-muted: #8b949e;
-  
+
   --primary: #58a6ff;
   --primary-glow: rgba(88, 166, 255, 0.3);
   --secondary: #1f6feb;
   --accent: #bc8cff;
-  
+
   --success: #3fb950;
   --warning: #d29922;
   --danger: #f85149;
-  
+
   --font-family: 'Inter', sans-serif;
 }
 
+/* Reset */
 * {
   box-sizing: border-box;
   margin: 0;
   padding: 0;
 }
 
+/* Body */
 body {
   font-family: var(--font-family);
   background-color: var(--bg-color);
@@ -39,7 +45,7 @@ body {
   overflow-x: hidden;
 }
 
-/* Dynamic Ambient Glows */
+/* Glow Effects */
 body::before {
   content: "";
   position: absolute;
@@ -64,7 +70,7 @@ body::after {
   z-index: -1;
 }
 
-/* Glassmorphism Panels */
+/* Glass Panels */
 .glass-panel {
   background: var(--panel-bg);
   backdrop-filter: blur(16px);
@@ -120,7 +126,7 @@ h1, h2, h3, h4, h5 {
   background-clip: text;
 }
 
-/* Layout Utilities */
+/* Layout */
 .container {
   max-width: 1200px;
   margin: 0 auto;
@@ -133,6 +139,7 @@ h1, h2, h3, h4, h5 {
   justify-content: center;
 }
 
+/* Animation */
 .view-enter {
   animation: fadeSlideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
@@ -148,17 +155,20 @@ h1, h2, h3, h4, h5 {
   }
 }
 
-/* Custom Scrollbar */
+/* Scrollbar */
 ::-webkit-scrollbar {
   width: 8px;
 }
+
 ::-webkit-scrollbar-track {
   background: var(--bg-color);
 }
+
 ::-webkit-scrollbar-thumb {
   background: var(--border-color);
   border-radius: 4px;
 }
+
 ::-webkit-scrollbar-thumb:hover {
   background: var(--text-muted);
 }

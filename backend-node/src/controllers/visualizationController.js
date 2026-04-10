@@ -1,30 +1,28 @@
-import Dataset from "../models/Dataset.js";
-import path from "path";
-import fs from "fs/promises";
-
 export const getVisualization = async (req, res) => {
   try {
-    const datasetId = req.params.id;
-    if (!datasetId) return res.status(400).json({ success: false, message: "Dataset ID required" });
+    res.json({ message: "Dashboard visualization working" });
+  } catch (error) {
+    res.status(500).json({ error: "Visualization error" });
+  }
+};
 
-    const userId = req.user?.id || "default_user";
-    const dashboardPath = path.resolve(process.cwd(), `../ml_engine/data/users/${userId}/${datasetId}/dashboard_config.json`);
-    
-    try {
-      const data = await fs.readFile(dashboardPath, "utf-8");
-      return res.json(JSON.parse(data));
-    } catch (e) {
-      return res.status(404).json({
-        success: false,
-        message: "Dashboard configuration not yet generated or available",
-      });
-    }
+export const getDatasetVisualization = async (req, res) => {
+  try {
+    const { employee_id, dataset_id } = req.params;
 
-  } catch (err) {
-    console.error("VISUAL CONTROLLER ERROR:", err);
-    return res.status(500).json({
-      success: false,
-      message: "Internal server error",
+    const data = [
+      { date: "2024-01-01", pm25: 120 },
+      { date: "2024-01-02", pm25: 80 },
+      { date: "2024-01-03", pm25: 200 },
+    ];
+
+    res.json({
+      employee_id,
+      dataset_id,
+      data,
     });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Visualization error" });
   }
 };

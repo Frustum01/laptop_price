@@ -13,9 +13,11 @@ import datasetRoutes from "./routes/datasetRoutes.js";
 import chatRoutes from "./routes/chatRoutes.js";
 import authRoutes from "./routes/authRoutes.js";
 import dataOperationsRoutes from "./routes/dataOperationsRoutes.js";
-
-// 🔥 IMPORT YOUR NEW ROUTE
 import filterRoutes from "./routes/filterRoutes.js";
+
+// ✅ NEW ROUTES
+import chatbotRoutes from "./routes/chatbotRoutes.js";
+import summaryRoutes from "./routes/summaryRoutes.js";
 
 dotenv.config();
 connectDB();
@@ -34,9 +36,11 @@ app.use("/api", datasetRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/api/analytics", analyticsRoutes);
 app.use("/api/data", dataOperationsRoutes);
-
-// 🔥 ADD THIS LINE (VERY IMPORTANT)
 app.use("/api", filterRoutes);
+
+// ✅ ADD THESE (NEW FEATURES)
+app.use("/api", chatbotRoutes);
+app.use("/api", summaryRoutes);
 
 /* ========== HEALTH CHECK ========== */
 app.get("/", (req, res) => {
@@ -52,7 +56,7 @@ app.get("/api/health", (req, res) => {
     env: {
       hasMongoUri: !!process.env.MONGO_URI,
       port: process.env.PORT || 5000,
-    }
+    },
   });
 });
 
