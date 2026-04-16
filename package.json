@@ -5,9 +5,9 @@
   "type": "module",
   "scripts": {
     "dev:backend": "cd backend-node && npm run dev",
-    "dev:frontend": "cd frontend-react && npm run dev",
+    "dev:frontend": "cd data_insights/frontend-react && npm run dev",
     "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
-    "install:all": "npm install && cd backend-node && npm install && cd ../frontend-react && npm install"
+    "install:all": "npm install && cd backend-node && npm install && cd ../data_insights/frontend-react && npm install"
   },
   "devDependencies": {
     "autoprefixer": "^10.4.27",

@@ -142,22 +142,49 @@ def scale_numerical_features(df, dataset_dir, exclude_cols=None):
 
 def derive_features(df, schema):
     """
-    Derives explicit features based on schema logic (e.g. sales = price * qty).
+    Derives explicit business features based on schema logic.
     """
     price_col = schema.get("price_column")
     qty_col = schema.get("quantity_column")
     sales_col = schema.get("sales_column")
+    profit_col = schema.get("profit_column")
+    discount_col = schema.get("discount_column")
+
     derived_cols = []
-    
+
+    # Derived Sales
     if price_col and qty_col and price_col in df.columns and qty_col in df.columns:
-        if not sales_col or sales_col not in df.columns:
-            if pd.api.types.is_numeric_dtype(df[price_col]) and pd.api.types.is_numeric_dtype(df[qty_col]):
+        if pd.api.types.is_numeric_dtype(df[price_col]) and pd.api.types.is_numeric_dtype(df[qty_col]):
+            if not sales_col or sales_col not in df.columns:
                 df["derived_sales"] = df[price_col].clip(lower=0) * df[qty_col].clip(lower=0)
-                logger.info("Derived 'derived_sales' feature from price and quantity.")
                 schema["sales_column"] = "derived_sales"
                 derived_cols.append("derived_sales")
-            
+                sales_col = "derived_sales"
+
+    # Sales Per Unit
+    if sales_col and qty_col and sales_col in df.columns and qty_col in df.columns:
+        df["sales_per_unit"] = df[sales_col] / df[qty_col].replace(0, 1)
+        derived_cols.append("sales_per_unit")
+
+    # Profit Margin
+    if profit_col and sales_col and profit_col in df.columns and sales_col in df.columns:
+        df["profit_margin"] = df[profit_col] / df[sales_col].replace(0, 1)
+        derived_cols.append("profit_margin")
+
+    # Discount Rate
+    if discount_col and discount_col in df.columns:
+        df["discount_rate"] = df[discount_col] * 100
+        derived_cols.append("discount_rate")
+
+    # Avg Order Value
+    if sales_col and sales_col in df.columns:
+        df["avg_order_value"] = df[sales_col].expanding().mean()
+        derived_cols.append("avg_order_value")
+
+    logger.info(f"Derived business features: {derived_cols}")
     return df, derived_cols
+   
+    
 
 
 def engineer_features(dataset_dir, use_scaler=False):
